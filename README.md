@@ -59,7 +59,7 @@ clm-harbor run -p <harbor-task> -a clm-minimal -m openai/<model> \
 ## Day 1 support: pi-clm for [Pi agent](https://github.com/earendil-works/pi)
 
 ```sh
-pi install git:github.com/lolipopshock/pi-clm
+pi install npm:@lolipopshock/pi-clm
 ```
 
 ## Repository
