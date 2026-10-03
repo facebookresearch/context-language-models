@@ -51,6 +51,13 @@ CLM for [Pi](https://github.com/earendil-works/pi):
 pi install npm:@lolipopshock/pi-clm
 ```
 
+Community port for [OpenCode](https://opencode.ai),
+[opencode-clm](https://github.com/bcmyguest/opencode-clm):
+
+```sh
+opencode plug opencode-clm
+```
+
 ## Getting started
 
 Run the minimal CLM agent on any [Harbor](https://github.com/laude-institute/harbor) task:
