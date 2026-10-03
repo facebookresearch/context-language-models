@@ -53,6 +53,7 @@ Per-request log lines (prefix `[kvreuse]`), used by analysis/scr_report.py:
 Startup banner: `[kvreuse-site] ... max_blocks=<K> ... splice_retry=<N>`.
 """
 import os
+from difflib import SequenceMatcher
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -435,8 +436,6 @@ def _evict_sessions(scheduler):
 # ---------------------------------------------------------------------------
 if _ON:
     try:
-        from difflib import SequenceMatcher
-
         from sglang.srt.managers.scheduler_components.invariant_checker import (
             SchedulerInvariantChecker as _SIC,
         )
