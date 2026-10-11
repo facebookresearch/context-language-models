@@ -51,11 +51,11 @@ CLM for [Pi](https://github.com/earendil-works/pi):
 pi install npm:@lolipopshock/pi-clm
 ```
 
-Community port for [OpenCode](https://opencode.ai),
+Community port for [OpenCode](https://opencode.ai) (not maintained by the CLM authors),
 [opencode-clm](https://github.com/bcmyguest/opencode-clm):
 
 ```sh
-opencode plug opencode-clm
+opencode plugin opencode-clm
 ```
 
 ## Getting started
