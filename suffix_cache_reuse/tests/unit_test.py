@@ -11,6 +11,8 @@
 """
 import os
 import sys
+from collections import OrderedDict
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ["KVREUSE_ENABLED"] = "0"
@@ -93,6 +95,93 @@ def test_diff_opcodes_rejected_fast_plan_falls_back_without_sglang():
                 fast.assert_called_once_with(old, new)
                 log.assert_called_once()
                 assert o._STATS == {"fastdiff_reject": 1}
+
+
+def _plan_edit(old, new):
+    # Supply a committed side-buffer description and bypass GPU initialization.
+    # The real session matcher, token diff, and relocation planner still run.
+    sess = {
+        "sid": "s", "key": None, "token_ids": old[:],
+        "positions": list(range(len(old))), "side_slot": 0,
+        "n_side": len(old), "side_ids": old[:],
+    }
+    scheduler = SimpleNamespace(
+        _kvreuse_sessions=OrderedDict(s=sess),
+        tp_worker=SimpleNamespace(model_runner=None),
+    )
+    req = SimpleNamespace(origin_input_ids=new, extra_key=None)
+    with patch.multiple(
+        o, _RT={"alloc": object()}, _STATS=o._STATS.copy(),
+        _TRACE=False, _DEBUG=False, _V6=True, _PIN_ONLY=False,
+        _V6_MIN_TAIL=64, _V6_MIN_EXTEND=16, _MAX_BLOCKS=1,
+        _FASTDIFF=True, _FASTDIFF_MIN=2048, _CDC_TARGET=64, _CDC_EXTEND=True,
+    ):
+        o._kvreuse_intercept(scheduler, req)
+        assert req._kvreuse_session is sess
+        assert sess["token_ids"] == new
+        assert sess["positions"] == list(range(len(new)))
+        return getattr(req, "_kvreuse_plan", None), o._STATS["passthrough_turns"]
+
+
+def test_plan_middle_deletion_reuses_shifted_suffix():
+    # Exercise both token-level difflib and the real long-input CDC path.
+    for n_a, n_c in ((1024, 128), (2048, 256)):
+        a = list(range(n_a))
+        c = list(range(5000, 5000 + n_c))
+        old, new = a + [9000] + c, a + c
+        plan, passthrough = _plan_edit(old, new)
+        assert plan is not None
+        assert passthrough == 0
+        tail = plan["tail"]
+        assert tail is not None
+        assert tail["lead_new_end"] == n_a
+        assert tail["bprime_end"] == n_a  # Direct splice: B' is empty.
+        assert tail["rows"] == list(range(n_a + 1, len(old) - 16))
+        assert tail["old_pos"] == tail["rows"]
+        assert [old[i] for i in tail["rows"]] == new[n_a:-16]
+        assert tail["n_c"] == n_c
+        assert tail["kext"] == 16
+
+
+def test_plan_middle_insertion_reuses_shifted_suffix():
+    for n_a, n_c in ((1024, 128), (2048, 256)):
+        a = list(range(n_a))
+        c = list(range(5000, 5000 + n_c))
+        old, new = a + c, a + [9000] + c
+        plan, passthrough = _plan_edit(old, new)
+        assert plan is not None
+        assert passthrough == 0
+        tail = plan["tail"]
+        assert tail is not None
+        assert tail["lead_new_end"] == n_a
+        assert tail["bprime_end"] == n_a + 1
+        assert tail["rows"] == list(range(n_a, len(old) - 16))
+        assert tail["old_pos"] == tail["rows"]
+        assert [old[i] for i in tail["rows"]] == new[n_a + 1:-16]
+        assert tail["n_c"] == n_c
+        assert tail["kext"] == 16
+
+
+def test_plan_unchanged_append_and_truncate_still_pass_through():
+    for n in (1152, 2304):
+        old = list(range(n))
+        for new in (old[:], old + [9000], old[:-1]):
+            plan, passthrough = _plan_edit(old, new)
+            assert plan is None
+            assert passthrough == 1
+
+
+def test_plan_same_length_replacement_still_reuses_suffix():
+    a, c = list(range(1024)), list(range(5000, 5128))
+    old, new = a + [9000] + c, a + [9001] + c
+    plan, passthrough = _plan_edit(old, new)
+    assert plan is not None
+    assert passthrough == 0
+    tail = plan["tail"]
+    assert tail is not None
+    assert tail["bprime_end"] == 1025
+    assert tail["rows"] == list(range(1025, len(old) - 16))
+    assert [old[i] for i in tail["rows"]] == new[1025:-16]
 
 
 if __name__ == "__main__":

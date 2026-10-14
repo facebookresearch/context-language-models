@@ -1457,7 +1457,11 @@ def _kvreuse_intercept(scheduler, req):
     deleted = sum(i2 - i1 for t, i1, i2, j1, j2 in ops if t in ("delete", "replace"))
     inserted = sum(j2 - j1 for t, i1, i2, j1, j2 in ops if t in ("insert", "replace"))
 
-    if inserted == 0 or kept == 0 or deleted == 0:
+    # A pure middle insertion or deletion can still leave a shifted suffix to
+    # relocate. Only one-sided edits with no shifted survivors (such as append
+    # or truncation) are handled entirely by ordinary prefix reuse.
+    shifted_survivors = any(t == "equal" and i1 != j1 for t, i1, i2, j1, j2 in ops)
+    if kept == 0 or ((inserted == 0 or deleted == 0) and not shifted_survivors):
         sess["token_ids"] = new_ids
         sess["positions"] = list(range(len(new_ids)))
         _STATS["passthrough_turns"] += 1

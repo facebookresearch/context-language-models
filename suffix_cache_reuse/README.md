@@ -256,7 +256,9 @@ python analysis/scr_report.py server.log
 ```
 
 - `tests/unit_test.py` checks session matching by `cache_salt` and the recurrent state
-  chosen when a planned relocation falls back to normal prefill.
+  chosen when a planned relocation falls back to normal prefill. It also checks CPU
+  diff fallback and relocation plans for middle insertions, deletions, and
+  replacements, while unchanged prompts, appends, and truncations pass through.
 - `tests/smoke.py` sends one three-turn conversation whose later turns delete sections
   from the middle of the first user message. With SCR on, the report shows relocated
   tokens on turns 2 and 3; with SCR off the same requests are served by the radix cache
