@@ -39,7 +39,9 @@ system_template: |
       open(p,"w").write(s)
       PY
 
-  **Rules:** don't `cat` this file (its text is already in your context). Keep the
+  **Rules:** don't `cat` this file (its text is already in your context). Exact current
+  pre/post-command mirror snapshots may be omitted from tool results; read it internally
+  to edit it. Keep the
   `[[CTX_TURN …]]` header of any turn you keep — emptying its text drops that turn; the
   system/task prefix is protected for you. Each result says whether the file changed or
   matched nothing.
