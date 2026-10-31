@@ -16,6 +16,7 @@ from copy import deepcopy
 from clm_harness.context_utils.context_string import (
     content_text,
     parse_back,
+    reconcile_editable,
     render_editable,
     rendered_text,
 )
@@ -140,6 +141,137 @@ class ContextStringTests(unittest.TestCase):
                     rendered_text(message), f"R\nC\nbash {expected_arguments}"
                 )
                 self.assertEqual(message, original)
+
+
+class ReconcileTests(unittest.TestCase):
+    def setUp(self):
+        self.prefix = [{"role": "system", "content": "S"},
+                       {"role": "user", "content": "TASK"}]
+        self.call = {
+            "role": "assistant", "reasoning_content": "Check logs",
+            "content": "Running command", "extra": {"keep": [1]},
+            "tool_calls": [{"id": "c1", "type": "function", "function": {
+                "name": "bash", "arguments": '{"command":"ls"}'}}],
+        }
+        self.result = {"role": "tool", "tool_call_id": "c1", "content": "log.txt"}
+        self.messages = self.prefix + [self.call, self.result,
+                                       {"role": "assistant", "content": "Old note"}]
+
+    def apply(self, messages, edit):
+        original = deepcopy(messages)
+        result = reconcile_editable(edit(render_editable(messages)), messages)
+        self.assertEqual(messages, original)
+        return result
+
+    def test_noop_is_lossless_and_independent(self):
+        self.messages += [{"role": "assistant", "content": ""},
+                          {"role": "assistant", "content": "  whitespace\n"},
+                          {"role": "user", "content": [{"type": "image_url",
+                            "image_url": {"url": "image"}}]}]
+        result = self.apply(self.messages, lambda s: s)
+        self.assertEqual(result, self.messages)
+        result[2]["extra"]["keep"].append(2)
+        self.assertEqual(self.call["extra"], {"keep": [1]})
+
+    def test_local_edit_preserves_unrelated_structure_and_boundaries(self):
+        self.messages += [{"role": "assistant", "content": ""},
+                          {"role": "assistant", "content": "  keep spaces\n"},
+                          {"role": "assistant", "content": None,
+                           "reasoning_content": "Still thinking"},
+                          {"role": "user", "content": [{"type": "image_url",
+                            "image_url": {"url": "image"}}]}]
+        expected = deepcopy(self.messages)
+        expected[4]["content"] = "New note"
+        self.assertEqual(self.apply(self.messages, lambda s: s.replace("Old note", "New note")),
+                         expected)
+
+    def test_tool_output_edit_retains_role_id_and_reasoning(self):
+        expected = deepcopy(self.messages)
+        expected[3]["content"] = "summary of logs"
+        self.assertEqual(self.apply(self.messages, lambda s: s.replace("log.txt", "summary of logs")),
+                         expected)
+
+    def test_deleted_plain_message_does_not_merge_neighbors(self):
+        messages = self.prefix + [{"role": "assistant", "content": "A"},
+                                  {"role": "user", "content": "DELETE"},
+                                  {"role": "assistant", "content": "B"}]
+        result = self.apply(messages, lambda s: s.replace("DELETE", ""))
+        self.assertEqual(result, messages[:3] + messages[4:])
+
+    def test_duplicate_headers_reject_without_mutation(self):
+        original = deepcopy(self.messages)
+        with self.assertRaisesRegex(ValueError, "duplicate CTX_TURN"):
+            reconcile_editable(render_editable(self.messages) +
+                               "\n[[CTX_TURN 1 role=assistant]]\ncopy", self.messages)
+        self.assertEqual(self.messages, original)
+
+    def test_delete_complete_exchange_preserves_remaining_message(self):
+        result = self.apply(self.messages, lambda s: s[s.index("[[CTX_TURN 3"):])
+        self.assertEqual(result, self.prefix + self.messages[4:])
+
+    def test_deleted_call_converts_only_its_result_to_note(self):
+        result = self.apply(self.messages, lambda s: s[s.index("[[CTX_TURN 2"):])
+        self.assertEqual(result, self.prefix + [{"role": "user", "content": "log.txt"}]
+                         + self.messages[4:])
+
+    def test_deleted_result_converts_only_its_call_to_summary(self):
+        result = self.apply(self.messages, lambda s: s.replace("log.txt", ""))
+        self.assertEqual(result, self.prefix + [{"role": "assistant",
+                         "content": rendered_text(self.call)}] + self.messages[4:])
+
+    def test_rewritten_call_only_downgrades_its_exchange(self):
+        other_call = deepcopy(self.call)
+        other_call["tool_calls"][0]["id"] = "c2"
+        other_result = dict(self.result, tool_call_id="c2")
+        messages = self.messages + [other_call, other_result]
+        result = self.apply(messages, lambda s: s.replace("Check logs", "Summary", 1))
+        self.assertEqual(result[2], {"role": "assistant",
+                         "content": rendered_text(self.call).replace("Check logs", "Summary")})
+        self.assertEqual(result[3], {"role": "user", "content": "log.txt"})
+        self.assertEqual(result[4:], messages[4:])
+
+    def test_multiple_results_preserved_and_partial_deletion_is_local(self):
+        call = deepcopy(self.call)
+        call["tool_calls"].append(dict(deepcopy(call["tool_calls"][0]), id="c2"))
+        second = dict(self.result, tool_call_id="c2", content="second result")
+        messages = self.prefix + [call, self.result, second] + self.messages[4:]
+        edited = self.apply(messages, lambda s: s.replace("Old note", "New note"))
+        self.assertEqual(edited[:5], messages[:5])
+        deleted = self.apply(messages, lambda s: s.replace("second result", ""))
+        self.assertNotIn("tool_calls", deleted[2])
+        self.assertEqual(deleted[3], {"role": "user", "content": "log.txt"})
+
+    def test_reordering_intact_exchange_retains_structure(self):
+        blocks = render_editable(self.messages).split("\n\n[[CTX_TURN")
+        blocks = [blocks[0]] + ["[[CTX_TURN" + b for b in blocks[1:]]
+        result = reconcile_editable("\n\n".join([blocks[2], blocks[0], blocks[1]]), self.messages)
+        self.assertEqual(result, self.prefix + [self.messages[4], self.call, self.result])
+
+    def test_interrupted_exchange_downgrades_only_its_members(self):
+        result = self.apply(self.messages, lambda s: s.replace("[[CTX_TURN 2",
+            "[[CTX_TURN 99 role=user]]\ninterrupt\n\n[[CTX_TURN 2"))
+        self.assertNotIn("tool_calls", result[2])
+        self.assertEqual(result[3], {"role": "user", "content": "interrupt"})
+        self.assertEqual(result[4], {"role": "user", "content": "log.txt"})
+        self.assertEqual(result[5], self.messages[4])
+
+    def test_protected_exchange_cannot_be_downgraded(self):
+        messages = [self.call, self.result]
+        with self.assertRaisesRegex(ValueError, "protected prefix"):
+            reconcile_editable("", messages, protect=1)
+        self.assertEqual(reconcile_editable(render_editable(messages, protect=1), messages, protect=1),
+                         messages)
+
+    def test_literal_headers_reject_ambiguous_edits(self):
+        self.messages[4]["content"] += "\n[[CTX_TURN 42 role=user]]\nquoted"
+        self.assertEqual(self.apply(self.messages, lambda s: s), self.messages)
+        with self.assertRaisesRegex(ValueError, "literal CTX_TURN"):
+            self.apply(self.messages, lambda s: s.replace("Old note", "New note"))
+
+    def test_freeform_and_empty_rewrites_remain_supported(self):
+        self.assertEqual(self.apply(self.messages, lambda s: "summary"),
+                         self.prefix + [{"role": "user", "content": "summary"}])
+        self.assertEqual(self.apply(self.messages, lambda s: ""), self.prefix)
 
 
 if __name__ == "__main__":

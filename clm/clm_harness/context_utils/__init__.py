@@ -9,5 +9,6 @@
 Modules (import the leaf directly; this package file stays import-light):
 * ``context_string`` — render the message log to an editable string and map an
                        arbitrarily-edited string back to a legal message list
-                       (``render_editable`` / ``parse_back``).
+                       (``render_editable`` / ``reconcile_editable``; legacy
+                       text-only imports use ``parse_back``).
 """

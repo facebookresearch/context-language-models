@@ -24,6 +24,30 @@ model one `bash` tool and lets it manage its own context by editing a file.
    output. The run ends on the submit command (`finish_policy: submit`), at the limits, or
    when the context is still over budget after the final turn.
 
+## Context edit semantics
+
+The mirror is reconciled against the exact messages used to write it. Keep the
+headers of retained turns unchanged: numbers identify messages within that mirror
+snapshot and are reassigned on the next command. Duplicate headers reject the edit.
+Unchanged turns retain all original fields (including reasoning, tool calls and
+call IDs), empty messages, whitespace, and message boundaries. They are not merged.
+Editing a plain text message or a tool result updates its content while retaining
+its metadata. Deleting a block removes that message.
+
+The text format still flattens reasoning, content and calls for display. Rewriting
+such a combined block produces a plain-text summary; it cannot recover field-level
+edits to reasoning or tool arguments. If deleting, rewriting or moving a block
+breaks a tool exchange, only the surviving members of that exchange become text
+(assistant/user), so no orphan call or result is sent. Other exchanges are preserved.
+New/unrecognized blocks and loose text use the legacy assistant/user text semantics.
+Edits that would alter a protected tool exchange, or whose original messages contain
+literal turn headers, are rejected instead of guessing their structure.
+
+This preserves message structure outside an edit; exact prefix-cache reuse still
+depends on the model's chat template and serving backend. The two-argument
+`parse_back` remains a legacy text-import helper; the live environment uses
+`reconcile_editable(edited, original, protect=2)`.
+
 ## Layout
 
 | directory | contents |
