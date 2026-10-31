@@ -40,7 +40,8 @@ system_template: |
       PY
 
   **Rules:** don't `cat` this file (its text is already in your context). Keep the
-  `[[CTX_TURN …]]` header of any turn you keep — emptying its text drops that turn; the
+  `[[CTX_TURN …]]` header of any turn you keep; do not renumber or duplicate headers.
+  Emptying a nonempty turn's text drops that turn; the
   system/task prefix is protected for you. Each result says whether the file changed or
   matched nothing.
 
