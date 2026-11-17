@@ -11,8 +11,8 @@ model's editable context to ``/tmp/.live_ctx/LIVE_CTX_MAIN.txt`` in the sandbox
 before each command; the model compacts by editing that file with ordinary shell
 tools (``sed``, ``python3 - <<'PY' …``, ``cat >`` …). After the command runs the
 harness reads the file back and, if it changed, maps it into the conversation via
-:func:`clm_harness.context_utils.context_string.parse_back` (protected system/task prefix pinned,
-roles recovered, result normalised to a legal message list).
+:func:`clm_harness.context_utils.context_string.reconcile_editable` (protected system/task
+prefix pinned, unchanged messages preserved, broken tool exchanges summarized).
 
 Because edits execute inside the sandbox VM (not via an in-process ``exec``), there
 is no sandboxed-code-execution concern.
@@ -444,7 +444,7 @@ class ClmAgent(BaseAgent):
             self._ctx.protect = self._protect
         else:
             # An applied context edit rebuilds the protected prefix from copies
-            # (parse_back), so update the ledger where it sits in `messages` now.
+            # (context reconciliation), so update the ledger where it sits in `messages` now.
             messages[self._ledger_index]["content"] = content
         self._retry_ledger = messages[self._ledger_index]
 
@@ -664,7 +664,7 @@ class ClmAgent(BaseAgent):
                         "n_bash": n_bash,
                         "n_ctx_syncs": self._ctx.n_ctx_syncs,
                         # Syncs whose token delta clears the trivial-edit bar; raw syncs
-                        # include zero-delta parse_back round-trips.
+                        # include zero-delta mirror edits.
                         "n_ctx_syncs_real": self._ctx.n_ctx_syncs_real,
                         # Subset of n_ctx_syncs that made context bigger (only possible
                         # under the fit gate).

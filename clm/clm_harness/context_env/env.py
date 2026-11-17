@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..context_utils.context_string import parse_back, render_editable
+from ..context_utils.context_string import reconcile_editable, render_editable
 from ..utils import tokens as tk
 from ..utils.budget import BudgetController
 from ..utils.finish_policy import SUBMIT_MARKER, is_submit_command
@@ -73,7 +73,7 @@ class ContextEnv:
         self.turns_since_edit = 0
         self.n_ctx_syncs = 0
         # Syncs whose token delta clears the trivial-edit bar. Raw n_ctx_syncs also
-        # counts parse_back round-trips that move ZERO tokens, so edit counts
+        # counts mirror edits that move ZERO tokens, so edit counts
         # should use this counter, not the raw one.
         self.n_ctx_syncs_real = 0
         self.n_ctx_grew = 0
@@ -210,7 +210,7 @@ class ContextEnv:
 
         if read_back is not None and read_back.strip() != rendered.strip():
             ctx_note, ctx_changed = self._apply_edit(
-                messages, rendered, read_back, before, limit, edit_rec
+                messages, read_back, before, limit, edit_rec
             )
         elif touched_ctx:
             rc = getattr(result, "return_code", 0)
@@ -260,15 +260,18 @@ class ContextEnv:
     def _apply_edit(
         self,
         messages: list[dict[str, Any]],
-        rendered: str,
         read_back: str,
         before: int,
         limit: int,
         edit_rec: dict[str, Any],
     ) -> tuple[str, bool]:
-        candidate = parse_back(read_back, messages[:self.protect])
+        try:
+            candidate = reconcile_editable(read_back, messages, protect=self.protect)
+        except ValueError as exc:
+            self.n_ctx_rejected += 1
+            return f"\n[LIVE_CTX_MAIN.txt: edit rejected — {exc}. Context unchanged.]", False
         after = tk.count_tokens(candidate)[0]
-        baseline = tk.count_tokens(parse_back(rendered, messages[:self.protect]))[0]
+        baseline = before
         edit_rec.update(before=baseline, after=after)
         if after > baseline and not edit_gate.may_grow(
             allow_growth=self.allow_edit_growth, limit=limit, after=after
@@ -281,8 +284,7 @@ class ContextEnv:
 
         messages[:] = candidate
         self.n_ctx_syncs += 1
-        # Delta measured baseline-vs-after, both round-tripped through render/parse, so
-        # the comparison uses one ruler.
+        # Compare actual structured contexts; a lossy round-trip is not a baseline.
         editable = max(baseline - edit_rec["prefix"], 1)
         if abs(baseline - after) >= max(TRIVIAL_EDIT_TOKENS,
                                         int(TRIVIAL_EDIT_FRACTION * editable)):
