@@ -24,6 +24,25 @@ model one `bash` tool and lets it manage its own context by editing a file.
    output. The run ends on the submit command (`finish_policy: submit`), at the limits, or
    when the context is still over budget after the final turn.
 
+The prompt asks the model to edit the mirror without printing its transcript back into
+context. As a best-effort guard against duplicate observations, the harness replaces
+complete, exact copies of the pre-command or post-command mirror with an omission note
+in stdout and stderr, before observation truncation and the newest-output budget cap.
+Uploads avoid host-platform newline translation; existing CR or CRLF characters in
+message content are preserved. Post-command echoes are matched against raw downloaded
+text, while edit reconciliation retains universal-newline conversion.
+Only snapshots starting with a serialized `[[CTX_TURN i role=...]]` header and a nonempty
+body qualify; empty or headerless edits such as `ok` are left alone. Raw execution
+results and exit codes remain intact, so printing a transcript still costs a task step.
+
+This guard matches content, not paths: an identical transcript printed from another
+file is omitted too. It permits internal reads, read-modify-write edits, redirects and
+ordinary file output. It does not deny filesystem access or provide a security boundary.
+Partial, transformed, encoded, intermediate or older transcript copies, copies split
+between stdout and stderr, and output truncated by a sandbox provider before reaching
+the harness are outside its scope. Diagnostics around an exact copy are retained and
+still subject to the usual output caps.
+
 ## Layout
 
 | directory | contents |

@@ -13,8 +13,11 @@ the command, reconcile the edit, and append the readout.
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import time
+from collections.abc import Iterator
+from heapq import merge
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +41,77 @@ TRIVIAL_EDIT_FRACTION = 0.01
 # A command that names the context directory only through one of these path parts is not
 # an attempt to edit the mirror, so it gets no "your edit matched nothing" note.
 _NOT_AN_EDIT = ("SUBCTX", "finished_subagents", "subagents")
+
+
+_TRANSCRIPT_START = re.compile(r"\[\[CTX_TURN \d+ role=[A-Za-z]+\]\](?:\r\n|\r|\n)")
+_ECHO_NOTE = "[verbatim editable-context transcript omitted; edit the mirror without printing it]"
+
+
+def _exact_match_spans(output: str, snapshot: str) -> Iterator[tuple[int, int]]:
+    """Yield all exact matches, including overlaps, in O(output + snapshot) time.
+
+    KMP's prefix table reuses matched prefixes instead of repeatedly searching
+    long periodic transcripts. The table takes O(snapshot) space; spans are lazy.
+    A Python scan adds overhead versus str.find on simple single-copy output.
+    An empty snapshot never qualifies for suppression and yields no matches.
+    """
+    if not snapshot or len(snapshot) > len(output):
+        return
+    prefix = [0] * len(snapshot)
+    matched = 0
+    for index in range(1, len(snapshot)):
+        while matched and snapshot[index] != snapshot[matched]:
+            matched = prefix[matched - 1]
+        if snapshot[index] == snapshot[matched]:
+            matched += 1
+        prefix[index] = matched
+
+    matched = 0
+    for index, char in enumerate(output):
+        while matched and char != snapshot[matched]:
+            matched = prefix[matched - 1]
+        if char == snapshot[matched]:
+            matched += 1
+        if matched == len(snapshot):
+            yield index + 1 - matched, index + 1
+            matched = prefix[matched - 1]
+
+
+def _suppress_context_echoes(output: str, snapshots: tuple[str | None, ...]) -> str:
+    """Omit complete, exact serialized transcript copies, not arbitrary file reads.
+
+    Headerless/empty edits are excluded: short text like ``ok`` could also be an
+    ordinary diagnostic. Partial, transformed, intermediate, or provider-truncated
+    copies are outside this best-effort guard. Matching is content-based, so an
+    identical transcript printed from another file is omitted too.
+    """
+    candidates = set()
+    for snapshot in snapshots:
+        if snapshot is None:
+            continue
+        header = _TRANSCRIPT_START.match(snapshot)
+        if header and snapshot[header.end():].strip():
+            candidates.add(snapshot)
+
+    # Discover matches against the ORIGINAL stream. Replacing one snapshot first
+    # could destroy a partially overlapping match of the other, leaving its tail.
+    # Merge the two lazy match streams, without storing every occurrence.
+    parts = []
+    cursor = 0
+    active = None
+    for start, end in merge(*(_exact_match_spans(output, snapshot) for snapshot in candidates)):
+        if active is None:
+            active = (start, end)
+        elif start < active[1]:
+            active = (active[0], max(active[1], end))
+        else:
+            parts.extend((output[cursor:active[0]], _ECHO_NOTE))
+            cursor = active[1]
+            active = (start, end)
+    if active is None:
+        return output
+    parts.extend((output[cursor:active[0]], _ECHO_NOTE, output[active[1]:]))
+    return "".join(parts)
 
 
 class ContextEnv:
@@ -113,14 +187,21 @@ class ContextEnv:
     async def write_mirror(self, environment: Any, messages: list[dict[str, Any]]) -> str:
         rendered = render_editable(messages, protect=self.protect)
         self.host_mirror.parent.mkdir(parents=True, exist_ok=True)
-        self.host_mirror.write_text(rendered, encoding="utf-8")
+        # Avoid host-platform translation; preserve rendered's existing newlines.
+        self.host_mirror.write_text(rendered, encoding="utf-8", newline="\n")
         await environment.upload_file(str(self.host_mirror), self.paths.ctx_file)
         return rendered
 
-    async def read_mirror(self, environment: Any) -> str | None:
+    async def read_mirror(
+        self, environment: Any, *, preserve_newlines: bool = False,
+    ) -> str | None:
         try:
             await environment.download_file(self.paths.ctx_file, str(self.host_mirror))
-            return self.host_mirror.read_text(encoding="utf-8", errors="replace")
+            with self.host_mirror.open(
+                encoding="utf-8", errors="replace",
+                newline="" if preserve_newlines else None,
+            ) as mirror:
+                return mirror.read()
         except Exception:  # noqa: BLE001
             return None
 
@@ -145,10 +226,15 @@ class ContextEnv:
         )
 
     # ------------------------------------------------------ observation text
-    def format_tool_result(self, result: Any) -> str:
-        output = result.stdout or ""
-        if result.stderr:
-            output += f"\n{result.stderr}" if output else result.stderr
+    def format_tool_result(
+        self, result: Any, *, context_snapshots: tuple[str | None, ...] = (),
+    ) -> str:
+        # Filter before rstrip/truncation, independently per stream. Never mutate
+        # result: the harness uses raw output for task-step/free-edit accounting.
+        output = _suppress_context_echoes(result.stdout or "", context_snapshots)
+        stderr = _suppress_context_echoes(result.stderr or "", context_snapshots)
+        if stderr:
+            output += f"\n{stderr}" if output else stderr
         output = output.rstrip()
         truncated = self.truncate_observation(output) if output else "(no output)"
         return f"{truncated}\n\n(exit_code={result.return_code})"
@@ -198,7 +284,13 @@ class ContextEnv:
         touched_ctx = ("LIVE_CTX_MAIN" in command) or (
             p.ctx_dir in command and not any(s in command for s in _NOT_AN_EDIT)
         )
-        read_back = await self.read_mirror(environment)
+        raw_read_back = await self.read_mirror(environment, preserve_newlines=True)
+        # Reconciliation retains read_text's original universal-newline semantics;
+        # echo matching uses the actual downloaded text, including CRLF or CR.
+        read_back = (
+            raw_read_back.replace("\r\n", "\n").replace("\r", "\n")
+            if raw_read_back is not None else None
+        )
         before = tk.count_tokens(messages)[0]
         limit = self.budget.strict_target or self.context_budget_tokens or 0
         edit_rec: dict[str, Any] = {
@@ -228,7 +320,9 @@ class ContextEnv:
                     f"`[[CTX_TURN 12 role=assistant]]` (turn index first, then role).]"
                 )
 
-        stdout_block = self.append_submit_warning(command, self.format_tool_result(result))
+        stdout_block = self.append_submit_warning(
+            command, self.format_tool_result(result, context_snapshots=(rendered, raw_read_back))
+        )
         readout = ""
         # Cap/readout see the assistant turn that the harness is about to append
         # (sync, then append msg, then count).
