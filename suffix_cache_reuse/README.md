@@ -2,6 +2,8 @@
 
 **Efficient CLM serving: reuse the KV cache of text that survives a context edit, for SGLang and vLLM.**
 
+Blog post: [Suffix Cache Reuse Explained — a deep dive in efficient serving for Context Language Models](https://wai-org.com/blog/clm/).
+
 A CLM edits its own context, so the prompt changes in the middle rather than only at the
 end. Standard prefix-cache reuse must then re-prefill every token after the first mismatch.
 Suffix Cache Reuse (SCR) removes most of this re-prefilling. When a span B is replaced by B′

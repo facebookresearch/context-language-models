@@ -42,6 +42,14 @@ contexts coexist as files.
 - **Reinforcement learning.** We also introduce an online reinforcement learning method for
   CLMs, improving Qwen3.5-9B performance on BrowseComp-Plus by 47.6% while using 12% fewer
   FLOPs.
+- **Efficient serving.** A context edit changes the prompt in the middle, where standard
+  prefix caching must re-prefill everything after the first mismatch. We release
+  [Suffix Cache Reuse](suffix_cache_reuse/) for SGLang and vLLM: it keeps the cached states
+  of every surviving token and re-prefills only the inserted text, matching standard serving
+  on BrowseComp-Plus with 65.5% of its prefix-reuse FLOPs. See the
+  [blog post](https://wai-org.com/blog/clm/) for a deep dive.
+
+<p align="center"><img src="suffix_cache_reuse/assets/scr_teaser.svg" width="100%" alt="Suffix Cache Reuse: after an edit replaces B with B′, A is reused as a prefix, only B′ is prefilled, and the cache of C moves to its new positions"></p>
 
 ## Day 1 Support
 
