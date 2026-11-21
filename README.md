@@ -66,6 +66,15 @@ Community port for [OpenCode](https://opencode.ai) (not maintained by the CLM au
 opencode plugin opencode-clm
 ```
 
+Community launcher for [GitHub Copilot CLI](https://github.com/github/copilot-cli)
+(not maintained by the CLM authors), [copilot-clm](https://github.com/DelicateNorman/copilot-clm):
+
+```sh
+uv tool install git+https://github.com/DelicateNorman/copilot-clm.git
+```
+
+Uses Copilot's BYOK interface and requires an existing OpenAI-compatible provider endpoint.
+
 ## Getting started
 
 Run the minimal CLM agent on any [Harbor](https://github.com/laude-institute/harbor) task:
