@@ -30,10 +30,13 @@ from .builder import TrajectoryBuilder
 from .models import (
     Agent,
     BranchTrigger,
+    FinalMetrics,
     Metrics,
     Observation,
     ObservationResult,
+    SpawnLink,
     Step,
+    SubTrajectory,
     ToolCall,
     Trajectory,
 )
@@ -292,9 +295,15 @@ def segment_records_from_snapshots(
     final_messages: list[dict[str, Any]] | None = None,
     *,
     edit_tool_names: tuple[str, ...] = _EDIT_TOOL_NAMES,
+    initial_prompt_len: int | None = None,
 ) -> list[dict[str, Any]]:
     """Split per-turn snapshots into ``{messages, prompt_len}`` epoch segments at
     every compaction (a turn whose next snapshot no longer extends it).
+
+    The first segment's prompt is the leading system/user messages of the first
+    snapshot, unless ``initial_prompt_len`` says how many leading messages were given
+    rather than generated (e.g. a sub-agent forked from a transcript that already holds
+    assistant turns).
 
     ``snapshots`` holds one request per LM call, in order. Every call contributes one
     assistant message: the reply that ended an epoch is located explicitly (see
@@ -308,10 +317,12 @@ def segment_records_from_snapshots(
         snaps = list(snaps) + [final_messages]
     if len(snaps) < 2:
         msgs = final_messages if final_messages is not None else (snaps[0] if snaps else [])
-        return [{"messages": msgs, "prompt_len": _lead_context_len(msgs)}]
+        return [{"messages": msgs, "prompt_len": (_lead_context_len(msgs) if initial_prompt_len
+                                                  is None else min(initial_prompt_len, len(msgs)))}]
 
     segments: list[dict[str, Any]] = []
-    epoch_prompt_len = _lead_context_len(snaps[0])
+    epoch_prompt_len = (_lead_context_len(snaps[0]) if initial_prompt_len is None
+                        else initial_prompt_len)
     # Positions (in the current epoch's message list) of replies that were sent and
     # then rolled back without changing anything else in the context.
     holes: list[int] = []
@@ -403,6 +414,131 @@ def _record_export_check(
     return check
 
 
+def _parent_link(traj: Trajectory, lm_call: int | None, **fields: Any) -> SpawnLink | None:
+    """The parent's ``lm_call``-th agent step (1-based; agent steps line up 1:1 with LM
+    calls, see :func:`segment_records_from_snapshots`) as a :class:`SpawnLink`. Clamped to
+    the last agent step if the counts disagree; ``None`` if there is no agent step."""
+    if lm_call is None:
+        return None
+    steps = [(seg, st) for seg in traj.segments for st in seg.steps if st.source == "agent"]
+    if not steps:
+        return None
+    seg, st = steps[min(max(int(lm_call), 1), len(steps)) - 1]
+    call_id = st.tool_calls[0].tool_call_id if st.tool_calls else None
+    return SpawnLink(segment_id=seg.segment_id, step_id=st.step_id, tool_call_id=call_id,
+                     **fields)
+
+
+def attach_subtrajectories(
+    traj: Trajectory,
+    records: list[dict[str, Any]],
+    *,
+    agent: Agent | dict[str, Any],
+    session_id: str | None = None,
+    model: str | None = None,
+    model_key: str | None = None,
+    n_body: float | None = None,
+    tokenizer: Any = None,
+    token_counter: Callable[[list[dict[str, Any]]], int] | None = None,
+    edit_tool_names: tuple[str, ...] = _EDIT_TOOL_NAMES,
+) -> list[SubTrajectory]:
+    """Attach one :class:`SubTrajectory` per sub-agent record (see
+    ``clm_harness.clm_agent.subagents.SubagentPool.records``).
+
+    Each record's ``dir`` holds the sub-agent's own ``context_snapshots/`` and
+    ``trajectory.json``; they are exported exactly like the main agent's, with per-call
+    metrics and FLOPs under the child's ``final_metrics.extra["kv_cache_flops"]``.
+    ``spawn``/``fold`` point at the main agent steps whose tool results reported the
+    launch and the end (``fold`` is ``None`` when the main agent never got that report,
+    e.g. the sub-agent was still running when the main agent ended)."""
+    from ..flops_metrics import attach_flops
+
+    base = agent if isinstance(agent, Agent) else Agent(**agent)
+    sub_agent = Agent(name=f"{base.name}-subagent", version=base.version,
+                      model_name=base.model_name)
+    subs: list[SubTrajectory] = []
+    for rec in records:
+        sub_id = rec["sub_id"]
+        d = Path(rec["dir"])
+        entries = _read_snapshot_files(d)
+        try:
+            final = json.loads((d / "trajectory.json").read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - fall back to the last snapshot
+            final = None
+        if not entries and final is None:
+            logger.warning("ctx-export: no record for sub-agent %s; skipped", sub_id)
+            continue
+        # Everything in the first request was given to the sub-agent (a brief, or the
+        # forked transcript with the main agent's assistant turns), none of it generated.
+        snaps = [m for _, m in entries]
+        seed = snaps[0] if snaps else (final or [])
+        seg_records = segment_records_from_snapshots(
+            snaps, final, edit_tool_names=edit_tool_names, initial_prompt_len=len(seed))
+        child = trajectory_from_segment_records(
+            seg_records, sub_agent, session_id=session_id, trajectory_id=sub_id,
+            token_counter=token_counter, edit_tool_names=edit_tool_names)
+        metrics = rec.get("metrics")
+        check = _record_export_check(child, entries, metrics)
+        if metrics:
+            _attach_agent_step_metrics(child, metrics)
+        attach_flops(child, n_body=n_body, model_key=model_key, model=model,
+                     tokenizer=tokenizer, completion_tokens_total=rec.get("completion_tokens"))
+        fm = child.final_metrics or FinalMetrics()
+        fm.total_prompt_tokens = rec.get("prompt_tokens")
+        fm.total_completion_tokens = rec.get("completion_tokens")
+        fm.total_cached_tokens = rec.get("cached_tokens")
+        fm.total_cost_usd = rec.get("cost_usd")
+        link = rec.get("link") or {}
+        spawn = _parent_link(traj, rec.get("spawn_call"),
+                             time_s=(link.get("spawn") or {}).get("time_s"),
+                             path=(link.get("spawn") or {}).get("path"),
+                             summary=f"launched {sub_id} ({rec.get('mode')})")
+        if spawn is None:
+            logger.warning("ctx-export: no parent step for sub-agent %s; skipped", sub_id)
+            continue
+        fold = _parent_link(traj, rec.get("fold_call"),
+                            time_s=(link.get("fold") or {}).get("time_s"),
+                            path=(link.get("fold") or {}).get("path"),
+                            summary=f"{sub_id} ended: {rec.get('status')}")
+        subs.append(SubTrajectory(
+            sub_id=sub_id, parent_trajectory_id=traj.trajectory_id, spawn=spawn, fold=fold,
+            agent=child.agent, segments=child.segments, final_metrics=fm,
+            extra={k: rec.get(k) for k in ("slot", "launch", "mode", "status", "steps",
+                                           "n_lm_calls")} | {"export_check": check},
+        ))
+    traj.subtrajectories = subs
+    return subs
+
+
+#: Additive fields of a ``kv_cache_flops`` dict (see ``compute_trajectory_flops``).
+_FLOPS_SUM_KEYS = (
+    "n_llm_calls", "n_aux_llm_calls", "aux_prefill_tokens", "aux_gen_tokens",
+    "n_reprefill_turns", "completion_tokens", "cache_aware_prefill_tokens",
+    "freeze_prefill_tokens", "naive_prefill_tokens", "cache_hit_tokens",
+    "cache_aware_attn_flops", "freeze_attn_flops", "naive_attn_flops",
+    "cache_aware_flops_linear", "freeze_flops_linear", "naive_flops_linear",
+    "cache_aware_flops", "freeze_flops", "naive_flops",
+)
+
+
+def sum_flops(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Sum ``kv_cache_flops`` dicts of separate trajectories (e.g. sub-agents, whose
+    prompts share no KV cache with each other). Additive fields are summed (``None`` if
+    every part has ``None``), the saved fractions recomputed, and the descriptive fields
+    taken from the first part. ``n_parts`` counts the inputs."""
+    out: dict[str, Any] = dict(parts[0]) if parts else {}
+    for k in _FLOPS_SUM_KEYS:
+        vals = [p.get(k) for p in parts]
+        out[k] = None if parts and all(v is None for v in vals) else sum(v or 0 for v in vals)
+    naive = out.get("naive_prefill_tokens") or 0
+    out["cache_saved_frac"] = round((out.get("cache_hit_tokens") or 0) / naive, 4) if naive else 0.0
+    out["freeze_saved_frac"] = (
+        round((naive - (out.get("freeze_prefill_tokens") or 0)) / naive, 4) if naive else 0.0)
+    out["prefill_source"] = ",".join(sorted({str(p.get("prefill_source")) for p in parts}))
+    out["n_parts"] = len(parts)
+    return out
+
+
 def export_ctx_trajectory(
     agent_dir: Path | str,
     *,
@@ -424,12 +560,15 @@ def export_ctx_trajectory(
     aux_gen_tokens: int = 0,
     n_aux_calls: int = 0,
     filename: str | None = "trajectory.ctx.json",
+    subagents: list[dict[str, Any]] | None = None,
 ) -> Trajectory:
     """One-call export used by the harness ``finally`` block: read the per-turn
     snapshots this run wrote, split at compactions, convert to ATIF-CTX, attach
     per-call server metrics, compute KV-cache-aware FLOPs + the unified
     ``compute_cost`` headline (USD for API models, FLOPs for open), and (if
-    ``filename``) write ``agent_dir/filename``. Returns the :class:`Trajectory`."""
+    ``filename``) write ``agent_dir/filename``. ``subagents`` (records from
+    ``SubagentPool.records``) are attached as sub-trajectories. Returns the
+    :class:`Trajectory`."""
     from ..flops_metrics import attach_compute_cost, attach_flops
 
     entries = _read_snapshot_files(agent_dir)
@@ -449,6 +588,11 @@ def export_ctx_trajectory(
         aux_prefill_tokens=aux_prefill_tokens, aux_gen_tokens=aux_gen_tokens,
         n_aux_calls=n_aux_calls,
     )
+    if subagents is not None:
+        attach_subtrajectories(
+            traj, subagents, agent=agent, session_id=session_id, model=resolved_model,
+            model_key=model_key, n_body=n_body, tokenizer=tokenizer,
+            token_counter=token_counter, edit_tool_names=edit_tool_names)
     # Rates (USD/token) let attach_compute_cost also emit a provider-INDEPENDENT USD
     # estimate from the local prefix-match token counts, alongside the provider one.
     try:
@@ -461,6 +605,22 @@ def export_ctx_trajectory(
         traj, cost_usd=cost_usd, model=resolved_model, cost_metric=cost_metric,
         in_rate=_in, out_rate=_out,
     )
+    if subagents is not None:
+        # kv_cache_flops stays the main agent's; the sub-agents get their own total, and
+        # compute_cost (with cost_usd, already the run total) covers both.
+        from ..flops_metrics import summarize_compute_cost
+
+        extra = traj.final_metrics.extra
+        sub_flops = sum_flops([s.final_metrics.extra["kv_cache_flops"]
+                               for s in traj.subtrajectories])
+        extra["kv_cache_flops_subagents"] = sub_flops
+        both = sum_flops([extra["kv_cache_flops"], sub_flops]) if traj.subtrajectories \
+            else extra["kv_cache_flops"]
+        extra["compute_cost"] = {
+            **summarize_compute_cost(both, cost_usd=cost_usd, model=resolved_model,
+                                     cost_metric=cost_metric, in_rate=_in, out_rate=_out),
+            "scope": "main+subagents",
+        }
     if filename:
         out = Path(agent_dir)
         out.mkdir(parents=True, exist_ok=True)

@@ -10,7 +10,8 @@
 #   API_BASE=http://localhost:8000/v1 clm/examples/run_harbor.sh <task_dir> [config] [extra harbor args...]
 #
 #   task_dir   a Harbor task (task.toml, instruction.md, environment/, tests/)
-#   config     bcp | edgebench | path to a config YAML (default: none, class defaults)
+#   config     bcp | edgebench | edgebench_sa | path to a config YAML (default: none,
+#              class defaults)
 #
 # Environment:
 #   API_BASE    OpenAI-compatible endpoint (required)
@@ -24,7 +25,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  sed -n '2,18p' "$0"; exit 2
+  sed -n '2,19p' "$0"; exit 2
 fi
 TASK_DIR=$(cd "$1" && pwd); shift
 CONFIG=${1:-}; [[ $# -gt 0 ]] && shift
@@ -39,7 +40,7 @@ HARBOR=${HARBOR:-harbor}
 
 case "$CONFIG" in
   "") CFG_FILE="" ;;
-  bcp|edgebench) CFG_FILE="$REPO/clm/clm_harness/configs/$CONFIG.yaml" ;;
+  bcp|edgebench|edgebench_sa) CFG_FILE="$REPO/clm/clm_harness/configs/$CONFIG.yaml" ;;
   *) CFG_FILE="$CONFIG" ;;
 esac
 

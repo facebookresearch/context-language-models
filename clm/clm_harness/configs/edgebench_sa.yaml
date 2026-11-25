@@ -1,0 +1,28 @@
+# ClmAgent settings for EdgeBench with parallel sub-agents: configs/edgebench.yaml plus
+# subagents=true (5 slots, 40 commands per sub-agent, 24 launches per run) and the
+# edgebench_sa task template. clm/examples/run_harbor.sh passes each entry as
+# --agent-kwarg.
+
+env: {}
+
+agent_kwargs:
+  max_steps: 100000              # effectively unbounded; the task's wall-clock limit ends the run
+  max_tokens: 8192
+  temperature: 0.7
+  top_p: none
+  command_timeout: 600
+  observation_max_chars: 10000
+  send_chat_template_kwargs: false
+  context_budget_tokens: 32000
+  max_num_retry_on_limit: 50
+  persistent_nudge_ratio: none   # off, as run for EdgeBench (the class default is adaptive)
+  checkpoint_interval_s: 3600
+  finalize_nudge_turns: 3
+  finalize_message: "Stop now: make sure the submitted files are in their best MEASURED state on THIS turn -- promote your best verified version into the submitted paths and confirm it still builds/runs, because whatever is on disk when you stop is what the judge grades."
+  finish_policy: open_ended
+  task_template: edgebench_sa
+  cost_metric: usd
+  subagents: true
+  n_subagent_slots: 5
+  subagent_max_steps: 40
+  subagent_lifetime_cap: 24

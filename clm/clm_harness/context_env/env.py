@@ -55,6 +55,7 @@ class ContextEnv:
         obs_cfg: dict[str, Any] | None = None,
         allow_edit_growth: bool = True,
         context_budget_tokens: int = 0,
+        subagents: bool = False,
     ) -> None:
         self.paths = paths
         self.budget = budget
@@ -65,6 +66,7 @@ class ContextEnv:
         self.obs_cfg = obs_cfg or dict(_DEFAULT_OBS)
         self.allow_edit_growth = allow_edit_growth
         self.context_budget_tokens = int(context_budget_tokens or 0)
+        self.subagents = bool(subagents)
         fd, tmp = tempfile.mkstemp(prefix="live_ctx_mirror_", suffix=".txt")
         os.close(fd)
         self.host_mirror = Path(tmp)
@@ -91,11 +93,13 @@ class ContextEnv:
         await environment.exec(command=cmd, timeout_sec=10)
 
     # ----------------------------------------------------------- command wrap
-    def wrap(self, command: str) -> str:
-        """Run ``command`` in the persistent shell: restore cwd/env, run, save them."""
+    def wrap(self, command: str, state_dir: str | None = None) -> str:
+        """Run ``command`` in the persistent shell: restore cwd/env, run, save them.
+
+        ``state_dir`` defaults to the main agent's; sub-agents pass their own."""
         if not self.persistent_bash:
             return command
-        state_dir = self.paths.state_dir
+        state_dir = state_dir or self.paths.state_dir
         return (
             f'cd "$(cat {state_dir}/cwd)" 2>/dev/null || true\n'
             f". {state_dir}/env 2>/dev/null || true\n"
@@ -198,6 +202,11 @@ class ContextEnv:
         touched_ctx = ("LIVE_CTX_MAIN" in command) or (
             p.ctx_dir in command and not any(s in command for s in _NOT_AN_EDIT)
         )
+        if self.subagents and any(s in command for s in _NOT_AN_EDIT):
+            # With sub-agents on, a command naming a slot or finished_subagents (e.g. a
+            # fork, `cp LIVE_CTX_MAIN.txt SUBCTX_2.txt`) is not a mirror edit, so no
+            # "NO change" note. A real edit is still detected and applied below.
+            touched_ctx = False
         read_back = await self.read_mirror(environment)
         before = tk.count_tokens(messages)[0]
         limit = self.budget.strict_target or self.context_budget_tokens or 0
@@ -228,7 +237,11 @@ class ContextEnv:
                     f"`[[CTX_TURN 12 role=assistant]]` (turn index first, then role).]"
                 )
 
-        stdout_block = self.append_submit_warning(command, self.format_tool_result(result))
+        stdout_block = self.format_tool_result(result)
+        if not (self.subagents and "SUBCTX" in command):
+            # A sub-agent brief normally tells the sub-agent to finish with the submit
+            # command; writing it into a slot is not a misplaced submit.
+            stdout_block = self.append_submit_warning(command, stdout_block)
         readout = ""
         # Cap/readout see the assistant turn that the harness is about to append
         # (sync, then append msg, then count).

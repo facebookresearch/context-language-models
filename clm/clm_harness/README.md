@@ -46,6 +46,7 @@ Each trial's agent log directory holds these files:
 - `timing.json`
 - per-call `context_snapshots/`
 - `trajectory.ctx.json`
+- `subagents/<sub_id>/`, only when sub-agents are on (see [Sub-agents](#sub-agents-optional))
 
 ## Install
 
@@ -67,7 +68,7 @@ clm-harbor trial start -p path/to/task -e docker -a clm-minimal -m openai/qwen36
   --agent-kwarg api_base=http://localhost:8000/v1 --clm-config bcp
 ```
 
-- `--clm-config bcp|edgebench|<path.yaml>` expands a config into `--agent-kwarg` flags;
+- `--clm-config bcp|edgebench|edgebench_sa|<path.yaml>` expands a config into `--agent-kwarg` flags;
   explicit `--agent-kwarg` values take precedence.
 - Unless given, `context_budget_tokens=32000` and `cost_metric=usd` are added.
 - With plain `harbor`, the same agent is `-a clm_harness.clm_agent.harness:ClmAgent`.
@@ -83,6 +84,7 @@ export MODEL=openai/qwen36-27b             # litellm model name (openai/<served 
 clm/examples/run_harbor.sh path/to/task              # class defaults, 32000-token budget
 clm/examples/run_harbor.sh path/to/task bcp          # BrowseComp-Plus settings
 clm/examples/run_harbor.sh path/to/task edgebench    # EdgeBench settings
+clm/examples/run_harbor.sh path/to/task edgebench_sa # EdgeBench settings with sub-agents
 HARBOR_ENV=singularity clm/examples/run_harbor.sh path/to/task bcp --trial-name t1
 ```
 
@@ -93,6 +95,7 @@ for the other environment variables.
 |---|---|---|
 | `configs/bcp.yaml` | BrowseComp-Plus (deep research) | 28672-token budget, 500 task steps (100 and 2000 were also used), 60k-char observations, persistent 90% nudge, 6 rollback retries, shrink edit gate |
 | `configs/edgebench.yaml` | EdgeBench (long-horizon improvement) | 32000-token budget, no step limit in practice, no finish command (`finish_policy: open_ended`), no persistent nudge, 50 retries, hourly checkpoints, EdgeBench finalize message |
+| `configs/edgebench_sa.yaml` | EdgeBench with sub-agents | `edgebench.yaml` plus `subagents: true` (5 slots, 40 commands each, 24 launches per run) and the `edgebench_sa` task template |
 
 A config is a YAML file with `agent_kwargs` (passed as `--agent-kwarg`) and `env` (exported
 before Harbor starts).
@@ -110,7 +113,8 @@ before Harbor starts).
 | `finalize_nudge_turns`, `finalize_message` | 3, none | In the last N turns, a notice tells the model to write its final output and submit. The count uses whichever runs out first, task steps or LM calls under the cap (`finalize_on_lm_call_cap`, default on). `finalize_message` is appended to the notice. |
 | `allow_edit_growth` / `CLM_EDIT_GATE` | fit | Edit gate. `fit` accepts an edit if the result fits the limit. `shrink` accepts it only if the context gets smaller. Both take `fit` or `shrink`; the kwarg also takes `true` (fit) or `false` (shrink). A rejected edit is not applied, and the model is told why. The kwarg overrides the env var. |
 | `finish_policy` | `submit` | `submit`: the model ends the run with `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`. `open_ended`: there is no finish command. |
-| `task_template` | `terminal_agent_tasks` | How the task is presented: `terminal_agent_tasks`, `open_problems` (the instruction as is), or `edgebench`. |
+| `task_template` | `terminal_agent_tasks` | How the task is presented: `terminal_agent_tasks`, `open_problems` (the instruction as is), `edgebench`, or `edgebench_sa` (EdgeBench with sub-agents). |
+| `subagents` | false | Parallel sub-agents launched through slot files; see [Sub-agents](#sub-agents-optional). |
 | `temperature`, `top_p`, `max_tokens` | 0.7, 0.95, 16384 | Sampling. Pass `none` to omit `temperature` or `top_p`. |
 | `cost_metric`, `flops_model_key` | auto | `usd` for priced API models. For local models, use `flops` with a model key (`9b` or `27b`) or `flops_n_body`. With `auto` (the default) the agent needs a FLOPs model size and refuses to start without one, whatever the model; pass `cost_metric=usd` to skip FLOPs accounting. The example script passes `usd` when no config sets it. |
 
@@ -125,3 +129,67 @@ vllm serve Qwen/Qwen3.6-27B --served-model-name qwen36-27b --max-model-len 65536
 
 The server's context window must hold `context_budget_tokens + max_tokens`. For API models,
 pass the litellm model name (e.g. `anthropic/...`) and leave `api_base` unset.
+
+## Sub-agents (optional)
+
+Off by default. With `subagents=true` the main agent can run up to `n_subagent_slots`
+sub-agents in parallel, each a separate `bash` loop of the same model in the same sandbox.
+The interface is files, like context editing:
+
+```bash
+clm-harbor trial start -p path/to/task -e docker -a clm-minimal -m openai/qwen36-27b \
+  --agent-kwarg api_base=http://localhost:8000/v1 --agent-kwarg subagents=true
+clm/examples/run_harbor.sh path/to/task edgebench_sa   # EdgeBench config with sub-agents
+```
+
+| kwarg | default | what it does |
+|---|---|---|
+| `subagents` | false | Turns the feature on. With it off nothing below applies and the run is unchanged. |
+| `n_subagent_slots` | 5 | Slots `SUBCTX_0` .. `SUBCTX_<n-1>`; also the number of sub-agents that can run at once. |
+| `subagent_max_steps` | 40 | Commands per sub-agent (LM calls are capped at twice this). |
+| `subagent_lifetime_cap` | 24 | Sub-agents launched over the whole run; `0` = unlimited. |
+| `subagent_self_compact` | false | Not implemented; `true` raises an error. |
+
+**Launching.** Creating or editing an idle slot file `/tmp/.live_ctx/SUBCTX_<i>.txt`
+launches a sub-agent after the main agent's command. A file containing `[[CTX_TURN`
+headers (e.g. `cp /tmp/.live_ctx/LIVE_CTX_MAIN.txt /tmp/.live_ctx/SUBCTX_2.txt`, then
+trimmed, with an instruction appended at the end) is a fork: the sub-agent continues from
+those turns, followed by a harness note saying that it is a forked sub-agent, that it cannot
+launch sub-agents or submit the task, and that its instruction is the text appended at the
+end. Anything else is a brief and becomes the sub-agent's only user message. The system prompt describes this protocol
+(prompts `subagent_addendum` and `subagent_system` in `clm_agent/prompts.yaml`). A turn that
+only launches sub-agents and prints nothing does not count as a task step.
+
+**While running.** A sub-agent works in the shared filesystem with its own persistent
+shell (starting from the main agent's working directory and exported environment) and its
+own context budget (`context_budget_tokens`, without rollback). It cannot compact, so it gets
+one note at 75% of its limit telling it to write its findings to its result file. Its transcript
+never enters the main context; the main agent sees the files it writes and a status note
+appended to each tool result (launches, ends, `sub-agents: R/N running`). Sub-agents cannot
+launch sub-agents: their commands that touch `SUBCTX_*` or `LIVE_CTX_MAIN` files are not run.
+The main agent's `lm_call_cap` counts only its own calls.
+
+**Ending.** A sub-agent ends when it runs `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+(whatever the main agent's `finish_policy`), after `subagent_max_steps` commands, after one
+final turn once its context reaches the budget, or on an LM error. Deleting its slot file
+stops it. Its slot file then moves to
+`/tmp/.live_ctx/finished_subagents/subctx_<i>_<n>/brief.txt` next to `final_message.txt`
+(the text of its last turn, or that turn's reasoning when the server returns the text only
+as `reasoning_content`; up to 4000 characters), and the slot is free again. Sub-agents still
+running when the main agent ends are stopped. Sub-agents are not checkpointed, so
+`resume_from` restores only the main agent.
+
+**Recorded.** For each sub-agent, `subagents/subctx_<i>_<n>/` in the agent log directory
+holds `context_snapshots/` (one per LM call plus the final context), `trajectory.json`,
+`timing.json`, `summary.json` (status, steps, tokens, cost), `brief.txt`,
+`final_message.txt` and `link.json` (written at launch and updated at the end, with the main
+agent's LM call that launched it and the one whose tool result reported its end).
+`trajectory.ctx.json` attaches each sub-agent as an ATIF-CTX v1.1 sub-trajectory with
+`spawn`/`fold` links into the main trajectory (`Trajectory.graph_edges()` gives the graph).
+In `usage.json`, the token counts and `cost_usd` at the top level are totals over the main
+agent and its sub-agents, and the `main` and `subagents` blocks hold the parts. A model call
+still in flight when a sub-agent is cancelled is not included in the totals. Cached and
+reasoning token counts appear only when the serving endpoint returns them; otherwise they are
+recorded as 0.
+`trajectory.ctx.json` keeps `kv_cache_flops` for the main agent, adds
+`kv_cache_flops_subagents`, and its `compute_cost` covers both (`scope: main+subagents`).

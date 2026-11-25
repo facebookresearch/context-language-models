@@ -1,0 +1,368 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""``ClmAgent`` with ``subagents=true``: settings, the env's edit detection, and a full
+scripted run in which the main agent launches sub-agents and uses their results."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import shutil
+import sys
+import tempfile
+import time
+import types
+import unittest
+from pathlib import Path
+
+import clm_fakes as F
+
+from clm_harness.clm_agent.harness import ClmAgent
+
+CTX = "/tmp/.live_ctx"
+FIN = f"{CTX}/finished_subagents"
+
+SPAWN_TWO = (
+    f"cat > {CTX}/SUBCTX_0.txt <<'EOF'\nSum 1..10 into /tmp/wa/out.txt. [script:a]\nEOF\n"
+    f"cat > {CTX}/SUBCTX_1.txt <<'EOF'\nCount to 3 into /tmp/wb/out.txt. [script:b]\nEOF"
+)
+SPAWN_SLOW = f"echo 'Loop forever. [script:slow]' > {CTX}/SUBCTX_2.txt"
+WORKERS = {
+    "a": ["mkdir -p /tmp/wa && python3 -c 'print(sum(range(11)))' > /tmp/wa/out.txt",
+          {"command": F.SUBMIT, "content": "Sum is in /tmp/wa/out.txt."}],
+    "b": ["mkdir -p /tmp/wb && seq 1 3 > /tmp/wb/out.txt",
+          {"command": F.SUBMIT, "content": "Counted to 3 in /tmp/wb/out.txt."}],
+    "slow": [{"command": "echo tick", "sleep": 0.3}] * 40,
+}
+
+
+def wait_files(sandbox: F.LocalSandbox, paths: list[str], command: str, timeout: float = 20.0):
+    """A script step that waits (in the model thread) until ``paths`` exist."""
+
+    def step(_messages):
+        end = time.monotonic() + timeout
+        while not all(sandbox.exists(p) for p in paths):
+            if time.monotonic() > end:
+                raise AssertionError(f"sub-agent output never appeared: {paths}")
+            time.sleep(0.02)
+        time.sleep(0.2)  # let the worker tasks finish their sandbox bookkeeping
+        return command
+
+    return step
+
+
+def run_e2e(tmp: Path, **agent_kwargs) -> tuple[F.LocalSandbox, F.ScriptedLLM, Path]:
+    sandbox = F.LocalSandbox(tmp / "sandbox")
+    main = [
+        SPAWN_TWO,
+        SPAWN_SLOW,
+        wait_files(sandbox, [f"{FIN}/subctx_0_1/final_message.txt",
+                             f"{FIN}/subctx_1_1/final_message.txt"],
+                   "mkdir -p /tmp/work && cat /tmp/wa/out.txt /tmp/wb/out.txt > /tmp/work/out.txt && "
+                   "cat /tmp/work/out.txt"),
+        f"cat {FIN}/subctx_0_1/final_message.txt",
+        F.SUBMIT,
+    ]
+    llm = F.ScriptedLLM(main, WORKERS)
+    kwargs = {"subagents": "true", "n_subagent_slots": 3, "subagent_max_steps": 40,
+              "context_budget_tokens": 6000}
+    kwargs.update(agent_kwargs)
+    agent = F.make_agent(tmp / "agent", **kwargs)
+    asyncio.run(F.run_agent(agent, sandbox, llm))
+    return sandbox, llm, tmp / "agent"
+
+
+class SettingsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="clm_sa_settings_"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_off_by_default(self) -> None:
+        agent = F.make_agent(self.tmp)
+        self.assertFalse(agent.subagents)
+        self.assertIsNone(agent._subs)
+        self.assertFalse(agent._ctx.subagents)
+
+    def test_on_without_launches_keeps_totals(self) -> None:
+        sandbox = F.LocalSandbox(self.tmp / "sandbox")
+        agent = F.make_agent(self.tmp / "agent", subagents="true")
+        asyncio.run(F.run_agent(agent, sandbox, F.ScriptedLLM(["echo hi", F.SUBMIT])))
+        u = json.loads((self.tmp / "agent" / "usage.json").read_text())
+        self.assertEqual(u["prompt_tokens"], u["main"]["prompt_tokens"])
+        self.assertEqual(u["subagents"]["n_launched"], 0)
+        cc = json.loads((self.tmp / "agent" / "trajectory.ctx.json").read_text())
+        self.assertEqual(cc["final_metrics"]["extra"]["compute_cost"]["scope"], "main+subagents")
+        self.assertEqual(cc["final_metrics"]["extra"]["kv_cache_flops_subagents"]["n_parts"], 0)
+        self.assertFalse((self.tmp / "agent" / "subagents").exists())
+
+    def test_on_with_defaults(self) -> None:
+        agent = F.make_agent(self.tmp, subagents="true")
+        self.assertEqual((agent._subs.cfg.n_slots, agent._subs.cfg.max_steps,
+                          agent._subs.cfg.lifetime_cap), (5, 40, 24))
+        self.assertTrue(agent._ctx.subagents)
+        self.assertIn("up to 5 sub-agents", agent._subs.prompt_addendum())
+
+    def test_edgebench_sa_config_and_template(self) -> None:
+        import yaml
+
+        from clm_harness.cli import CONFIG_DIR, _config_items
+        from clm_harness.task_templates import instance_template
+
+        _, base = _config_items("edgebench")
+        _, sa = _config_items("edgebench_sa")
+        self.assertEqual({k: v for k, v in sa.items() if base.get(k) != v},
+                         {"task_template": "edgebench_sa", "subagents": "true",
+                          "n_subagent_slots": "5", "subagent_max_steps": "40",
+                          "subagent_lifetime_cap": "24"})
+        self.assertEqual(set(base) - set(sa), set())
+        kwargs = yaml.safe_load((CONFIG_DIR / "edgebench_sa.yaml").read_text())["agent_kwargs"]
+        agent = ClmAgent(logs_dir=self.tmp, model_name=F.MODEL, **kwargs)
+        self.assertEqual(agent._subs.cfg.n_slots, 5)
+        self.assertTrue(instance_template("edgebench_sa").startswith(
+            instance_template("edgebench").rstrip("\n")))
+        self.assertIn("## Explore in parallel with sub-agents", instance_template("edgebench_sa"))
+
+    def test_other_removed_settings_still_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            F.make_agent(self.tmp, subagents="true", shadow_hints="1")
+
+    def test_self_compact_not_implemented(self) -> None:
+        with self.assertRaises(NotImplementedError):
+            F.make_agent(self.tmp, subagents="true", subagent_self_compact="true")
+
+    def test_contextbench_refuses_subagents(self) -> None:
+        stream = types.ModuleType("contextbench.stream")
+        stream.MARKER_PARAGRAPH = "marker"
+        mixin = types.ModuleType("contextbench.harbor.mixin")
+        mixin.CBStreamMixin = type("CBStreamMixin", (), {})
+        stubs = {"contextbench": types.ModuleType("contextbench"),
+                 "contextbench.harbor": types.ModuleType("contextbench.harbor"),
+                 "contextbench.stream": stream, "contextbench.harbor.mixin": mixin}
+        saved = {k: sys.modules.get(k) for k in [*stubs, "clm_contextbench.clm_stream"]}
+        sys.modules.update(stubs)
+        sys.modules.pop("clm_contextbench.clm_stream", None)
+        try:
+            from clm_contextbench.clm_stream import ClmStream
+
+            with self.assertRaisesRegex(ValueError, "does not support subagents"):
+                ClmStream(logs_dir=self.tmp, model_name=F.MODEL, subagents="true")
+            ClmStream(logs_dir=self.tmp, model_name=F.MODEL)  # unchanged without it
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+
+class EnvEditDetectionTests(unittest.IsolatedAsyncioTestCase):
+    """``cp LIVE_CTX_MAIN.txt SUBCTX_2.txt`` names the mirror but does not edit it."""
+
+    async def _step(self, subagents: bool, command: str) -> str:
+        tmp = Path(tempfile.mkdtemp(prefix="clm_sa_env_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        sandbox = F.LocalSandbox(tmp / "sandbox")
+        agent = F.make_agent(tmp / "agent", **({"subagents": "true"} if subagents else {}))
+        await agent._ctx.setup_dirs(sandbox)
+        msgs = [{"role": "system", "content": "S"}, {"role": "user", "content": "T"},
+                {"role": "assistant", "content": "a"}, {"role": "user", "content": "b"}]
+        obs = await agent._ctx.step(command, msgs, environment=sandbox)
+        return obs.render()
+
+    async def test_fork_copy_gets_no_false_note(self) -> None:
+        cmd = f"cp {CTX}/LIVE_CTX_MAIN.txt {CTX}/SUBCTX_2.txt"
+        self.assertNotIn("NO change", await self._step(True, cmd))
+        self.assertIn("NO change", await self._step(False, cmd))  # unchanged when off
+
+    async def test_real_edit_still_detected(self) -> None:
+        cmd = (f"sed -i 's/^a$/A/' {CTX}/LIVE_CTX_MAIN.txt && "
+               f"cp {CTX}/LIVE_CTX_MAIN.txt {CTX}/SUBCTX_0.txt")
+        self.assertIn("edit applied", await self._step(True, cmd))
+
+    async def test_brief_with_submit_line_gets_no_submit_warning(self) -> None:
+        cmd = (f"cat > {CTX}/SUBCTX_0.txt <<'B'\nDo x.\nFinish with: "
+               "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\nB")
+        self.assertNotIn("submit ignored", await self._step(True, cmd))
+        self.assertIn("submit ignored", await self._step(False, cmd))  # unchanged when off
+        self.assertIn("submit ignored", await self._step(
+            True, "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT now"))
+
+    async def test_missed_edit_still_reported(self) -> None:
+        cmd = f"sed -i 's/nothing/x/' {CTX}/LIVE_CTX_MAIN.txt"
+        self.assertIn("NO change", await self._step(True, cmd))
+
+
+class ForkExportTests(unittest.TestCase):
+    """A fork starts from the main agent's turns: they are the sub-trajectory's input,
+    not steps it generated."""
+
+    def test_fork_subtrajectory_counts_only_its_own_steps(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="clm_sa_fork_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        sandbox = F.LocalSandbox(tmp / "sandbox")
+        fork = f"cp {CTX}/LIVE_CTX_MAIN.txt {CTX}/SUBCTX_0.txt"
+        main = [{"command": "echo one", "content": "[script:f] plan"}, "echo two", fork,
+                wait_files(sandbox, [f"{FIN}/subctx_0_1/final_message.txt"], "true"), F.SUBMIT]
+        llm = F.ScriptedLLM(main, {"f": ["echo forked", F.SUBMIT]})
+        agent = F.make_agent(tmp / "agent", subagents="true", context_budget_tokens=6000)
+        asyncio.run(F.run_agent(agent, sandbox, llm))
+        from clm_harness.agent_trajectory_format.models import Trajectory
+
+        traj = Trajectory.model_validate_json((tmp / "agent" / "trajectory.ctx.json").read_text())
+        (sub,) = traj.subtrajectories
+        self.assertEqual(sub.extra["mode"], "fork")
+        check = sub.extra["export_check"]
+        self.assertTrue(check["consistent"], check)
+        self.assertEqual(check["agent_steps"], 2)  # the fork's own two LM calls
+        seed = sub.segments[0].input_context
+        self.assertEqual(seed[0].role, "system")
+        self.assertIn("[script:f] plan", json.dumps([m.content for m in seed]))
+        steps = [st for st in sub.segments[0].steps if st.source == "agent"]
+        self.assertTrue(all(st.metrics is not None for st in steps))
+
+
+class EndToEndTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="clm_sa_e2e_"))
+        cls.sandbox, cls.llm, cls.logs = run_e2e(cls.tmp)
+        cls.traj = json.loads((cls.logs / "trajectory.json").read_text())
+        cls.usage = json.loads((cls.logs / "usage.json").read_text())
+        cls.timing = json.loads((cls.logs / "timing.json").read_text())
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def tool(self, i: int) -> str:
+        return [m["content"] for m in self.traj if m["role"] == "tool"][i]
+
+    def test_prompt_addendum(self) -> None:
+        self.assertIn("## Sub-agents", self.traj[0]["content"])
+        self.assertIn("up to 3 sub-agents", self.traj[0]["content"])
+
+    def test_main_uses_worker_results(self) -> None:
+        self.assertEqual(self.sandbox.read("/tmp/work/out.txt").split(), ["55", "1", "2", "3"])
+        self.assertIn("SUBCTX_0 launched as subctx_0_1 (brief)", self.tool(0))
+        self.assertIn("SUBCTX_1 launched as subctx_1_1 (brief)", self.tool(0))
+        self.assertIn("SUBCTX_0 finished (completed, 2 steps)", self.tool(2))
+        self.assertIn("SUBCTX_1 finished (completed, 2 steps)", self.tool(2))
+        self.assertIn("Sum is in /tmp/wa/out.txt.", self.tool(3))
+        self.assertTrue(self.traj[-1]["content"].startswith("COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"))
+
+    def test_spawn_turns_are_free(self) -> None:
+        free = [t for t in self.timing if t.get("free_ctx_turn")]
+        self.assertEqual(len(free), 2)  # both launch turns printed nothing
+        self.assertEqual(self.usage["free_ctx_turns"], 2)
+
+    def test_worker_transcripts_stay_out_of_main(self) -> None:
+        text = json.dumps(self.traj)
+        self.assertNotIn("[a#0]", text)
+        self.assertNotIn("Counted to 3", text)
+
+    def test_running_worker_cancelled_at_end(self) -> None:
+        summary = json.loads((self.logs / "subagents" / "subctx_2_1" / "summary.json").read_text())
+        self.assertEqual(summary["status"], "cancelled_end_of_run")
+        self.assertLess(summary["steps"], 40)
+
+    # --- recording / export -------------------------------------------------
+    def ctx_traj(self):
+        from clm_harness.agent_trajectory_format.models import Trajectory
+
+        return Trajectory.model_validate_json((self.logs / "trajectory.ctx.json").read_text())
+
+    def test_worker_records(self) -> None:
+        for sub_id in ("subctx_0_1", "subctx_1_1", "subctx_2_1"):
+            d = self.logs / "subagents" / sub_id
+            for name in ("trajectory.json", "timing.json", "summary.json", "link.json",
+                         "brief.txt", "final_message.txt"):
+                self.assertTrue((d / name).is_file(), f"{sub_id}/{name}")
+            kinds = [json.loads(p.read_text()).get("kind")
+                     for p in sorted((d / "context_snapshots").glob("turn-*.json"))]
+            self.assertEqual(kinds[-1], "final")
+            self.assertTrue(all(k == "agent" for k in kinds[:-1]))
+
+    def test_subtrajectories_validate(self) -> None:
+        from clm_harness.agent_trajectory_format.validator import TrajectoryValidator
+
+        v = TrajectoryValidator()
+        ok = v.validate(str(self.logs / "trajectory.ctx.json"))
+        self.assertTrue(ok, v.get_errors())
+        traj = self.ctx_traj()
+        subs = {s.sub_id: s for s in traj.subtrajectories}
+        self.assertEqual(sorted(subs), ["subctx_0_1", "subctx_1_1", "subctx_2_1"])
+        for sub in subs.values():
+            self.assertTrue(sub.segments[0].input_context[0].content.startswith(
+                "You are a sub-agent"))
+            self.assertIn("kv_cache_flops", sub.final_metrics.extra)
+            self.assertTrue(sub.extra["export_check"]["consistent"], sub.extra)
+        self.assertEqual(subs["subctx_0_1"].extra["status"], "completed")
+        self.assertEqual(subs["subctx_2_1"].extra["status"], "cancelled_end_of_run")
+
+    def test_spawn_and_fold_links(self) -> None:
+        traj = self.ctx_traj()
+        steps = {st.step_id: st for seg in traj.segments for st in seg.steps}
+        subs = {s.sub_id: s for s in traj.subtrajectories}
+
+        def command(link):
+            return json.loads(steps[link.step_id].tool_calls[0].arguments)["command"]
+
+        self.assertEqual(command(subs["subctx_0_1"].spawn), SPAWN_TWO)
+        self.assertEqual(command(subs["subctx_1_1"].spawn), SPAWN_TWO)
+        self.assertEqual(command(subs["subctx_2_1"].spawn), SPAWN_SLOW)
+        self.assertIn("/tmp/work/out.txt", command(subs["subctx_0_1"].fold))
+        self.assertIsNone(subs["subctx_2_1"].fold)  # still running when main ended
+
+        edges = traj.graph_edges()
+        spawns = {(a, b) for a, b, k in edges if k == "spawn"}
+        folds = {(a, b) for a, b, k in edges if k == "fold"}
+        self.assertEqual({b.split(":")[0] for _, b in spawns},
+                         {"subctx_0_1", "subctx_1_1", "subctx_2_1"})
+        self.assertEqual({a.split(":")[0] for a, _ in folds}, {"subctx_0_1", "subctx_1_1"})
+
+    # --- accounting ---------------------------------------------------------
+    def test_usage_blocks_sum_to_run_totals(self) -> None:
+        u = self.usage
+        self.assertEqual(u["usage_scope"], "main+subagents")
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens"):
+            self.assertEqual(u[key], u["main"][key] + u["subagents"][key], key)
+        self.assertAlmostEqual(u["cost_usd"], u["main"]["cost_usd"] + u["subagents"]["cost_usd"])
+        self.assertGreater(u["subagents"]["prompt_tokens"], 0)
+        self.assertGreater(u["subagents"]["cost_usd"], 0)
+        self.assertEqual(u["n_lm_calls"], u["main"]["n_lm_calls"])  # the main agent's cap
+        self.assertEqual(u["subagents"]["n_launched"], 3)
+        self.assertEqual(u["subagents"]["by_status"],
+                         {"completed": 2, "cancelled_end_of_run": 1})
+        per_worker = [json.loads(p.read_text())
+                      for p in sorted((self.logs / "subagents").glob("*/summary.json"))]
+        self.assertEqual(u["subagents"]["prompt_tokens"],
+                         sum(w["prompt_tokens"] for w in per_worker))
+        self.assertEqual(u["subagents"]["n_lm_calls"], sum(w["n_lm_calls"] for w in per_worker))
+
+    def test_flops_and_compute_cost_scope(self) -> None:
+        traj = self.ctx_traj()
+        extra = traj.final_metrics.extra
+        self.assertEqual(extra["kv_cache_flops"]["n_llm_calls"], self.usage["main"]["n_lm_calls"])
+        subs = extra["kv_cache_flops_subagents"]
+        self.assertEqual(subs["n_parts"], 3)
+        self.assertEqual(subs["n_llm_calls"], self.usage["subagents"]["n_lm_calls"])
+        self.assertEqual(subs["naive_prefill_tokens"],
+                         sum(s.final_metrics.extra["kv_cache_flops"]["naive_prefill_tokens"]
+                             for s in traj.subtrajectories))
+        cc = extra["compute_cost"]
+        self.assertEqual(cc["scope"], "main+subagents")
+        self.assertAlmostEqual(cc["usd_api"], self.usage["cost_usd"])
+        self.assertAlmostEqual(traj.final_metrics.total_cost_usd, self.usage["cost_usd"])
+        self.assertEqual(cc["naive_prefill_tokens"],
+                         extra["kv_cache_flops"]["naive_prefill_tokens"]
+                         + subs["naive_prefill_tokens"])
+
+
+if __name__ == "__main__":
+    unittest.main()

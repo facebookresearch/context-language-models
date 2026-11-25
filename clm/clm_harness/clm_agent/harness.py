@@ -63,6 +63,7 @@ from ..context_env.env import ContextEnv
 from ..context_env.paths import Paths
 from ..utils.tool_schemas import BASH_TOOL
 from ..task_templates import instance_template as _load_instance_template
+from .subagents import SubagentConfig, SubagentPool
 
 os.environ.setdefault("OPENAI_API_KEY", "dummy")
 # Register public list prices so litellm can cost gateway models it doesn't know.
@@ -118,9 +119,8 @@ _REMOVED_KWARGS = frozenset({
     "gauge_v4", "extract_threshold", "gauge_solo", "gauge_sweep", "span_enforce",
     "seed", "cost_limit", "obs_offload", "authoring_harvest", "auto_apply",
     "research_ledger", "unlimited_ctx_turns", "enforce_budget",
-    "capture_prompt_token_ids", "context_tool", "subagents", "n_subagent_slots",
-    "subagent_max_steps", "subagent_lifetime_cap", "subagent_self_compact",
-    "ctx_prompts", "ctx_metadata", "ctx_archive", "refresh_rollback_ledger",
+    "capture_prompt_token_ids", "context_tool", "ctx_prompts", "ctx_metadata",
+    "ctx_archive", "refresh_rollback_ledger",
 })
 
 
@@ -244,6 +244,15 @@ class ClmAgent(BaseAgent):
         # "submit" (default): the agent ends the run with the submit command.
         # "open_ended": no finish command; the run ends at its step/time limit.
         finish_policy: str = "submit",
+        # Optional parallel sub-agents launched through SUBCTX_<i>.txt slot files (see
+        # clm_harness.clm_agent.subagents). Off by default; the other four settings only
+        # apply when it is on. subagent_lifetime_cap bounds launches over the whole run
+        # (0 = unlimited).
+        subagents: bool | str = False,
+        n_subagent_slots: int = 5,
+        subagent_max_steps: int = 40,
+        subagent_lifetime_cap: int = 24,
+        subagent_self_compact: bool | str = False,
         **kwargs: Any,
     ) -> None:
         removed = sorted(k for k in kwargs if k in _REMOVED_KWARGS)
@@ -331,6 +340,9 @@ class ClmAgent(BaseAgent):
         self.cost: float = 0.0
         self._skills = SkillMount(skill_dirs, skill_env_keys, skill_mount_dir)
         self._protect = _PROTECT
+        self.subagents = self._as_bool(subagents)
+        sub_cfg = SubagentConfig.from_kwargs(n_subagent_slots, subagent_max_steps,
+                                             subagent_lifetime_cap, subagent_self_compact)
         self._ctx = ContextEnv(
             paths=Paths(sys.modules[__name__]),
             budget=self._budget,
@@ -341,7 +353,10 @@ class ClmAgent(BaseAgent):
             obs_cfg=_OBS_CFG,
             allow_edit_growth=self.allow_edit_growth,
             context_budget_tokens=self.context_budget_tokens or 0,
+            subagents=self.subagents,
         )
+        self._subs = (SubagentPool(self, self._ctx, self._ctx.paths, sub_cfg)
+                      if self.subagents else None)
         self._host_mirror = self._ctx.host_mirror
         self.instance_template = _load_instance_template(task_template)
         self._resume = ResumeState(resume_from)
@@ -409,6 +424,8 @@ class ClmAgent(BaseAgent):
     # ------------------------------------------------------------------ setup
     async def setup(self, environment: BaseEnvironment) -> None:
         await self._ctx.setup_dirs(environment)
+        if self._subs is not None:
+            await self._subs.setup(environment)
         if self._skills.enabled:
             await self._skills.install(
                 environment, state_dir=_STATE_DIR, persistent_bash=self.persistent_bash
@@ -463,6 +480,8 @@ class ClmAgent(BaseAgent):
         system_content = system_content.replace(
             "{{finish_instructions}}", self.finish_policy.prompt_fragment()
         )
+        if self._subs is not None:
+            system_content += "\n\n" + self._subs.prompt_addendum()
         if self._skills.enabled:
             system_content += "\n\n---\n\n" + self._skills.prompt_suffix()
         instance_prompt = self.instance_template.replace("{{task}}", instruction.strip())
@@ -618,6 +637,12 @@ class ClmAgent(BaseAgent):
                 messages.append(msg)  # this turn's bash call (after the sync rewrite)
                 agent_step_metrics.append(turn_metrics)
                 tool_content = obs.render()
+                # Sub-agents: report ended ones, launch new slots. A launch is free like
+                # a pure compaction (see below).
+                spawned = False
+                if self._subs is not None:
+                    sub_note, spawned = await self._subs.poll(command)
+                    tool_content += sub_note
 
                 messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": tool_content})
                 n_bash += 1
@@ -636,7 +661,7 @@ class ClmAgent(BaseAgent):
                     not (result.stdout or "").strip() and not (result.stderr or "").strip()
                 )
                 if ctx_turn_is_free(
-                    ctx_changed=bool(ctx_changed), return_code=result.return_code,
+                    ctx_changed=bool(ctx_changed) or spawned, return_code=result.return_code,
                     task_output_empty=task_output_empty,
                 ):
                     free_ctx_turns += 1
@@ -646,6 +671,13 @@ class ClmAgent(BaseAgent):
                 else:
                     step += 1
         finally:
+            if self._subs is not None:
+                await self._subs.cancel_all()
+            # Run totals: the main agent's own, plus its sub-agents' when they are on.
+            run_usage, run_cost, sub_usage = dict(usage_totals), self.cost, {}
+            if self._subs is not None:
+                run_usage, run_cost, sub_usage = self._subs.usage_report(
+                    usage_totals, self.cost, n_lm_calls=self.n_lm_calls, n_bash=n_bash)
             self.logs_dir.mkdir(parents=True, exist_ok=True)
             tk.record(self.logs_dir, total_iters + 1, messages, extra={"final": True})
             # Final retained context as one more snapshot on the same counter,
@@ -658,8 +690,8 @@ class ClmAgent(BaseAgent):
             (self.logs_dir / "usage.json").write_text(
                 json.dumps(
                     {
-                        **usage_totals,
-                        "cost_usd": self.cost,
+                        **run_usage,
+                        "cost_usd": run_cost,
                         "max_steps": self.max_steps,
                         "n_bash": n_bash,
                         "n_ctx_syncs": self._ctx.n_ctx_syncs,
@@ -687,14 +719,15 @@ class ClmAgent(BaseAgent):
                         "budget_finalized": self._budget.finalized,
                         # Hashes of the harness source, so runs can be matched to code.
                         "code_fingerprint": code_fingerprint(),
+                        **sub_usage,
                     },
                     indent=2,
                 )
                 + "\n"
             )
-            context.cost_usd = self.cost
-            context.n_input_tokens = usage_totals["prompt_tokens"]
-            context.n_output_tokens = usage_totals["completion_tokens"]
+            context.cost_usd = run_cost
+            context.n_input_tokens = run_usage["prompt_tokens"]
+            context.n_output_tokens = run_usage["completion_tokens"]
 
             if self.emit_ctx_trajectory:
                 try:
@@ -708,10 +741,12 @@ class ClmAgent(BaseAgent):
                         model_key=self.flops_model_key,
                         n_body=self.flops_n_body,
                         tokenizer=self.flops_tokenizer,
-                        cost_usd=self.cost,
+                        cost_usd=run_cost,
                         cost_metric=self.cost_metric,
                         completion_tokens_total=usage_totals["completion_tokens"],
                         token_counter=lambda m: tk.count_tokens(m)[0],
+                        **({"subagents": self._subs.records()} if self._subs is not None
+                           else {}),
                     )
                 except Exception as exc:  # export must never crash a run
                     logger.warning("ctx-trajectory export failed: %s: %s", type(exc).__name__, exc)

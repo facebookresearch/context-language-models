@@ -148,6 +148,11 @@ class ClmStream(CBStreamMixin, ClmAgent):
 
     def __init__(self, *args: Any, skill: str | None = "clm", skills_dir: str | None = None,
                  **kwargs: Any) -> None:
+        if ClmAgent._as_bool(kwargs.get("subagents", False)):
+            # The stream releases ops from the main loop's submit hook; a sub-agent in the
+            # same sandbox would act outside that protocol.
+            raise ValueError("ClmStream does not support subagents=true; run ContextBench "
+                             "tasks without sub-agents.")
         merged = {**PAPER_KWARGS, **kwargs}
         super().__init__(*args, **merged)
         self.finish_policy = _MarkerFinish(self.finish_policy.mode)
