@@ -91,11 +91,13 @@ class ContextEnv:
         await environment.exec(command=cmd, timeout_sec=10)
 
     # ----------------------------------------------------------- command wrap
-    def wrap(self, command: str) -> str:
-        """Run ``command`` in the persistent shell: restore cwd/env, run, save them."""
+    def wrap(self, command: str, state_dir: str | None = None) -> str:
+        """Run ``command`` in the persistent shell: restore cwd/env, run, save them.
+
+        ``state_dir`` defaults to the main agent's; sub-agents pass their own."""
         if not self.persistent_bash:
             return command
-        state_dir = self.paths.state_dir
+        state_dir = state_dir or self.paths.state_dir
         return (
             f'cd "$(cat {state_dir}/cwd)" 2>/dev/null || true\n'
             f". {state_dir}/env 2>/dev/null || true\n"

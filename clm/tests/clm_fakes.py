@@ -160,11 +160,13 @@ class ScriptedLLM:
     calls it through ``asyncio.to_thread``."""
 
     def __init__(self, main: list[Step], workers: dict[str, list[Step]] | None = None,
-                 *, after_script: Step = SUBMIT) -> None:
+                 *, after_script: Step = SUBMIT, main_system: str | None = None) -> None:
         self.main = list(main)
         self.workers = dict(workers or {})
         self.after_script = after_script
-        self.main_system: str | None = None
+        # The main agent is recognised by its system prompt, taken from the first request
+        # unless given (pass any non-matching string when every caller is a sub-agent).
+        self.main_system: str | None = main_system
         self.calls: list[tuple[str, int]] = []  # (who, index), in call order
         self._lock = threading.Lock()
         self._n_main = 0
