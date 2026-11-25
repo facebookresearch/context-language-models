@@ -1,0 +1,85 @@
+[
+  {
+    "step": 1,
+    "context_budget_nudge": 0.25,
+    "tokens": 1222
+  },
+  {
+    "step": 1,
+    "llm_s": 0,
+    "bash_s": 0,
+    "return_code": 0,
+    "ctx_touched": false,
+    "ctx_synced": false,
+    "cmd": "mkdir -p /tmp/work && cd /tmp/work && printf 'alpha\\nbeta\\n' > notes.txt && cat notes.txt"
+  },
+  {
+    "step": 2,
+    "llm_s": 0,
+    "empty_turn": true
+  },
+  {
+    "step": 3,
+    "llm_s": 0,
+    "bash_s": 0,
+    "return_code": 0,
+    "ctx_touched": false,
+    "ctx_synced": false,
+    "cmd": "seq 1 300"
+  },
+  {
+    "step": 4,
+    "context_budget_nudge": 0.5,
+    "tokens": 1656
+  },
+  {
+    "step": 4,
+    "llm_s": 0,
+    "bash_s": 0,
+    "return_code": 0,
+    "ctx_touched": true,
+    "ctx_synced": true,
+    "cmd": "python3 - <<'PY'\nimport re; p='/tmp/.live_ctx/LIVE_CTX_MAIN.txt'; s=open(p).read()\ns=re.sub(r'\\n1\\n2\\n3\\n(?:\\d+\\n)*300\\n', '\\n[seq output dropped: 1..300]\\n', s)\nopen(p,'w').write(s)\nPY"
+  },
+  {
+    "iter": 4,
+    "free_ctx_turn": true,
+    "cmd": "python3 - <<'PY'\nimport re; p='/tmp/.live_ctx/LIVE_CTX_MAIN.txt'; s=open(p).read()\ns=re.sub(r'\\n1\\n2\\n3\\n(?:\\d+\\n)*300\\n"
+  },
+  {
+    "step": 4,
+    "llm_s": 0,
+    "bash_s": 0,
+    "return_code": 0,
+    "ctx_touched": true,
+    "ctx_synced": false,
+    "cmd": "sed -i 's/no-such-text/x/' /tmp/.live_ctx/LIVE_CTX_MAIN.txt"
+  },
+  {
+    "step": 5,
+    "llm_s": 0,
+    "bash_s": 0,
+    "return_code": 0,
+    "ctx_touched": false,
+    "ctx_synced": false,
+    "cmd": "pwd && wc -l < notes.txt && echo ready > /tmp/work/out.txt"
+  },
+  {
+    "step": 6,
+    "llm_s": 0,
+    "bash_s": 0,
+    "return_code": 0,
+    "ctx_touched": false,
+    "ctx_synced": false,
+    "cmd": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT extra"
+  },
+  {
+    "step": 7,
+    "llm_s": 0,
+    "bash_s": 0,
+    "return_code": 0,
+    "ctx_touched": false,
+    "ctx_synced": false,
+    "cmd": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+  }
+]

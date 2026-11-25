@@ -1,0 +1,133 @@
+[
+  {
+    "role": "system",
+    "content": "You are a helpful assistant that can interact with a computer.\n\nYour response must include a THOUGHT section before your action where you\nexplain your reasoning. After the THOUGHT, you must call the `bash` tool\nwith EXACTLY ONE bash command (multiple commands chained with `&&` or `||`\ncount as a single action).\n\nFailure to follow these rules \u2014 calling no tool, calling a tool other than\n`bash`, or omitting the THOUGHT \u2014 will cause your response to be rejected.\n\n## Managing your context\n\n**Goal: maximize task success** \u2014 keep going until the task is done or you run out of\nbudget (no penalty for extra turns). Your context budget is 2744 tokens; each\nresult shows your current size.\n\nYour conversation is mirrored to `/tmp/.live_ctx/LIVE_CTX_MAIN.txt` (refreshed before\nevery command). **Free up context by editing that file** \u2014 replace stale regions (big\noutputs, dead ends, superseded notes) with a concise, specific summary. A bloated\ntranscript wastes budget and dulls your reasoning, so compact as it grows. An editing\nturn is free only when its command applies a real edit and prints nothing \u2014 any\nstdout/stderr, a non-zero exit, or an edit that matches nothing costs a normal turn.\n\n**Locate text with code \u2014 never paste or retype it** (context is long: retyping wastes\ntokens and usually mis-matches). Turns are numbered `[[CTX_TURN 1 \u2026]]`, `[[CTX_TURN 2 \u2026]]`,\n\u2026 in order from the top of the editable region (the hidden system/task prefix is NOT\ncounted, so the first turn you can edit is 1). Match a turn by its `[[CTX_TURN <i> role=\u2026]]`\nheader, a block by a short unique first/last line, or slice on the headers:\n    python3 - <<'PY'\n    import re; p=\"/tmp/.live_ctx/LIVE_CTX_MAIN.txt\"; s=open(p).read()\n    # collapse turn 7 (its header -> the next header); its body is never retyped:\n    s=re.sub(r\"(\\[\\[CTX_TURN 7 [^\\]]*\\]\\]).*?(?=\\n\\[\\[CTX_TURN|\\Z)\",\n             r\"\\1\\n[grep done: parser.py:142 drops quoted commas; fix=csv.reader]\", s, flags=re.S)\n    open(p,\"w\").write(s)\n    PY\n\n**Rules:** don't `cat` this file (its text is already in your context). Keep the\n`[[CTX_TURN \u2026]]` header of any turn you keep \u2014 emptying its text drops that turn; the\nsystem/task prefix is protected for you. Each result says whether the file changed or\nmatched nothing.\n\n**Compact cheaply** \u2014 an edit forces everything *after* it to be re-read, so cost grows\nwith how much text FOLLOWS the edit:\n- **Batch**: one large compaction beats many small edits.\n- **Mind what's below your edit** \u2014 it all gets re-read, so don't compact a small early\n  region while a long, still-useful tail sits beneath it (that re-reads the whole tail\n  for little gain). Keep a useful tail; if it's much larger than what you'd compact,\n  wait and compact head + tail together \u2014 UNLESS you expect to hit the context limit\n  soon, then compact now.\n- **Be generous in the summary**: the tail is re-read regardless, so a detailed\n  replacement is essentially free.\n\nWhen you are finished, submit by running the standalone command\n`echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` (with nothing else in that command).\nAfter it runs you cannot continue.\n"
+  },
+  {
+    "role": "user",
+    "content": "Please solve this task:\n\nWrite the word ready to /tmp/work/out.txt.\n\nYou can execute bash commands and edit files (with `sed`, `cat > file << 'EOF'`,\netc.) to implement the necessary changes.\n\n## Recommended Workflow\n\nThis workflow should be done step-by-step so that you can iterate on your\nchanges and any possible problems.\n\n1. Analyze the codebase / environment by finding and reading relevant files.\n2. If applicable, create a script to reproduce the issue or expected behaviour.\n3. Implement the change(s) by editing the source code or environment state.\n4. Verify your fix works by running your script (or relevant test) again.\n5. Test edge cases to ensure your fix is robust.\n6. Submit your changes and finish your work by issuing the standalone command\n   `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` \u2014 do not combine it with any\n   other command. After this command you cannot continue working on this task.\n\n## Important Rules\n\n1. Every response must contain exactly one tool call to `bash`.\n2. Directory and environment-variable changes ARE persistent across calls in\n   this harness \u2014 `cd` and `export` stick (unlike upstream mini-swe-agent's\n   subshell model; treat the shell as a long-running login shell).\n3. Long-running commands: wrap with `timeout`, e.g. `timeout 30 <command>`.\n4. Interactive commands are not possible. Use non-interactive flags or pipe\n   `yes`/`no` as appropriate.\n5. Output may be truncated. Use `head`, `tail`, `grep`, `sed -n 'A,Bp'`, etc.\n   to filter large outputs.\n\n## Useful command examples\n\n### Create a new file:\n`cat <<'EOF' > newfile.py\nimport numpy as np\nprint(\"hello\")\nEOF`\n\n### Edit files with sed:\n`sed -i 's/old_string/new_string/g' filename.py`\n\n### View file content:\n`nl -ba filename.py | sed -n '10,20p'`\n"
+  },
+  {
+    "role": "user",
+    "content": "CONTEXT BUDGET NUDGE: context is at ~25% of your 3000-token budget (1222 tokens). No action needed. Before your next few searches, make sure your notes record which queries and documents you already tried."
+  },
+  {
+    "role": "assistant",
+    "content": "[main#0] THOUGHT: step 0.\nbash {\"command\": \"mkdir -p /tmp/work && cd /tmp/work && printf 'alpha\\\\nbeta\\\\n' > notes.txt && cat notes.txt\"}"
+  },
+  {
+    "role": "user",
+    "content": "alpha\nbeta\n\n(exit_code=0)\n[context: ~1313/2744 tokens]"
+  },
+  {
+    "role": "assistant",
+    "content": "[main#1] THOUGHT: thinking out loud without a tool call."
+  },
+  {
+    "role": "user",
+    "content": "(No tool call in your last turn. When ready, issue your next `bash` command to continue the task.)"
+  },
+  {
+    "role": "assistant",
+    "content": "[main#2] THOUGHT: step 2.\nbash {\"command\": \"seq 1 300\"}"
+  },
+  {
+    "role": "user",
+    "content": "[seq output dropped: 1..300]\n\n(exit_code=0)\n[context: ~1649/2744 tokens]\n\nCONTEXT BUDGET NUDGE: context is at ~50% of your 3000-token budget (1656 tokens). Finish the unit of work in flight, then tidy ONCE. When you write a replacement note, COPY facts forward from the text you are replacing (quote them): every RULED OUT candidate with its reason and the words 'do not retry'; the exact queries/commands already tried; exact values marked VERIFIED or UNVERIFIED; and a NEXT line. Compact /tmp/.live_ctx/LIVE_CTX_MAIN.txt by locating stale regions with code (match a turn by its [[CTX_TURN i ...]] header or a block by short start/end anchors) and replacing them with summaries \u2014 do not retype the text you remove. Compact settled spans; keep anything you have not finished using."
+  },
+  {
+    "role": "assistant",
+    "content": "[main#3] THOUGHT: step 3.",
+    "tool_calls": [
+      {
+        "id": "call_main_3",
+        "type": "function",
+        "function": {
+          "name": "bash",
+          "arguments": "{\"command\": \"python3 - <<'PY'\\nimport re; p='/tmp/.live_ctx/LIVE_CTX_MAIN.txt'; s=open(p).read()\\ns=re.sub(r'\\\\n1\\\\n2\\\\n3\\\\n(?:\\\\d+\\\\n)*300\\\\n', '\\\\n[seq output dropped: 1..300]\\\\n', s)\\nopen(p,'w').write(s)\\nPY\"}"
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "tool_call_id": "call_main_3",
+    "content": "(no output)\n\n(exit_code=0)\n[context: ~1636/2744 tokens]\n[LIVE_CTX_MAIN.txt: edit applied \u2014 context ~1833->1569 tokens, 9 turns]"
+  },
+  {
+    "role": "assistant",
+    "content": "[main#4] THOUGHT: step 4.",
+    "tool_calls": [
+      {
+        "id": "call_main_4",
+        "type": "function",
+        "function": {
+          "name": "bash",
+          "arguments": "{\"command\": \"sed -i 's/no-such-text/x/' /tmp/.live_ctx/LIVE_CTX_MAIN.txt\"}"
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "tool_call_id": "call_main_4",
+    "content": "(no output)\n\n(exit_code=0)\n[context: ~1693/2744 tokens]\n[LIVE_CTX_MAIN.txt: NO change \u2014 your edit matched nothing, so context is still ~1661 tokens. Match text you have already seen, or target the real turn headers, which look like `[[CTX_TURN 12 role=assistant]]` (turn index first, then role).]"
+  },
+  {
+    "role": "assistant",
+    "content": "[main#5] THOUGHT: step 5.",
+    "tool_calls": [
+      {
+        "id": "call_main_5",
+        "type": "function",
+        "function": {
+          "name": "bash",
+          "arguments": "{\"command\": \"pwd && wc -l < notes.txt && echo ready > /tmp/work/out.txt\"}"
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "tool_call_id": "call_main_5",
+    "content": "/tmp/work\n2\n\n(exit_code=0)\n[context: ~1793/2744 tokens]"
+  },
+  {
+    "role": "assistant",
+    "content": "[main#6] THOUGHT: step 6.",
+    "tool_calls": [
+      {
+        "id": "call_main_6",
+        "type": "function",
+        "function": {
+          "name": "bash",
+          "arguments": "{\"command\": \"echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT extra\"}"
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "tool_call_id": "call_main_6",
+    "content": "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT extra\n\n(exit_code=0)\n\n[submit ignored: COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT must be a standalone command: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.]\n[context: ~1871/2744 tokens]"
+  },
+  {
+    "role": "assistant",
+    "content": "[main#7] THOUGHT: step 7.",
+    "tool_calls": [
+      {
+        "id": "call_main_7",
+        "type": "function",
+        "function": {
+          "name": "bash",
+          "arguments": "{\"command\": \"echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\"}"
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "tool_call_id": "call_main_7",
+    "content": "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n\n(exit_code=0)\n[context: ~1912/2744 tokens]"
+  }
+]
