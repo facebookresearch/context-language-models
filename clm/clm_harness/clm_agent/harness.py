@@ -739,6 +739,8 @@ class ClmAgent(BaseAgent):
                         cost_metric=self.cost_metric,
                         completion_tokens_total=usage_totals["completion_tokens"],
                         token_counter=lambda m: tk.count_tokens(m)[0],
+                        **({"subagents": self._subs.records()} if self._subs is not None
+                           else {}),
                     )
                 except Exception as exc:  # export must never crash a run
                     logger.warning("ctx-trajectory export failed: %s: %s", type(exc).__name__, exc)

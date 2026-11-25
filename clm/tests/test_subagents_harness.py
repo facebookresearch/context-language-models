@@ -166,6 +166,35 @@ class EnvEditDetectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("NO change", await self._step(True, cmd))
 
 
+class ForkExportTests(unittest.TestCase):
+    """A fork starts from the main agent's turns: they are the sub-trajectory's input,
+    not steps it generated."""
+
+    def test_fork_subtrajectory_counts_only_its_own_steps(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="clm_sa_fork_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        sandbox = F.LocalSandbox(tmp / "sandbox")
+        fork = f"cp {CTX}/LIVE_CTX_MAIN.txt {CTX}/SUBCTX_0.txt"
+        main = [{"command": "echo one", "content": "[script:f] plan"}, "echo two", fork,
+                wait_files(sandbox, [f"{FIN}/subctx_0_1/final_message.txt"], "true"), F.SUBMIT]
+        llm = F.ScriptedLLM(main, {"f": ["echo forked", F.SUBMIT]})
+        agent = F.make_agent(tmp / "agent", subagents="true", context_budget_tokens=6000)
+        asyncio.run(F.run_agent(agent, sandbox, llm))
+        from clm_harness.agent_trajectory_format.models import Trajectory
+
+        traj = Trajectory.model_validate_json((tmp / "agent" / "trajectory.ctx.json").read_text())
+        (sub,) = traj.subtrajectories
+        self.assertEqual(sub.extra["mode"], "fork")
+        check = sub.extra["export_check"]
+        self.assertTrue(check["consistent"], check)
+        self.assertEqual(check["agent_steps"], 2)  # the fork's own two LM calls
+        seed = sub.segments[0].input_context
+        self.assertEqual(seed[0].role, "system")
+        self.assertIn("[script:f] plan", json.dumps([m.content for m in seed]))
+        steps = [st for st in sub.segments[0].steps if st.source == "agent"]
+        self.assertTrue(all(st.metrics is not None for st in steps))
+
+
 class EndToEndTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -209,6 +238,61 @@ class EndToEndTests(unittest.TestCase):
         summary = json.loads((self.logs / "subagents" / "subctx_2_1" / "summary.json").read_text())
         self.assertEqual(summary["status"], "cancelled_end_of_run")
         self.assertLess(summary["steps"], 40)
+
+    # --- recording / export -------------------------------------------------
+    def ctx_traj(self):
+        from clm_harness.agent_trajectory_format.models import Trajectory
+
+        return Trajectory.model_validate_json((self.logs / "trajectory.ctx.json").read_text())
+
+    def test_worker_records(self) -> None:
+        for sub_id in ("subctx_0_1", "subctx_1_1", "subctx_2_1"):
+            d = self.logs / "subagents" / sub_id
+            for name in ("trajectory.json", "timing.json", "summary.json", "link.json",
+                         "brief.txt", "final_message.txt"):
+                self.assertTrue((d / name).is_file(), f"{sub_id}/{name}")
+            kinds = [json.loads(p.read_text()).get("kind")
+                     for p in sorted((d / "context_snapshots").glob("turn-*.json"))]
+            self.assertEqual(kinds[-1], "final")
+            self.assertTrue(all(k == "agent" for k in kinds[:-1]))
+
+    def test_subtrajectories_validate(self) -> None:
+        from clm_harness.agent_trajectory_format.validator import TrajectoryValidator
+
+        v = TrajectoryValidator()
+        ok = v.validate(str(self.logs / "trajectory.ctx.json"))
+        self.assertTrue(ok, v.get_errors())
+        traj = self.ctx_traj()
+        subs = {s.sub_id: s for s in traj.subtrajectories}
+        self.assertEqual(sorted(subs), ["subctx_0_1", "subctx_1_1", "subctx_2_1"])
+        for sub in subs.values():
+            self.assertTrue(sub.segments[0].input_context[0].content.startswith(
+                "You are a sub-agent"))
+            self.assertIn("kv_cache_flops", sub.final_metrics.extra)
+            self.assertTrue(sub.extra["export_check"]["consistent"], sub.extra)
+        self.assertEqual(subs["subctx_0_1"].extra["status"], "completed")
+        self.assertEqual(subs["subctx_2_1"].extra["status"], "cancelled_end_of_run")
+
+    def test_spawn_and_fold_links(self) -> None:
+        traj = self.ctx_traj()
+        steps = {st.step_id: st for seg in traj.segments for st in seg.steps}
+        subs = {s.sub_id: s for s in traj.subtrajectories}
+
+        def command(link):
+            return json.loads(steps[link.step_id].tool_calls[0].arguments)["command"]
+
+        self.assertEqual(command(subs["subctx_0_1"].spawn), SPAWN_TWO)
+        self.assertEqual(command(subs["subctx_1_1"].spawn), SPAWN_TWO)
+        self.assertEqual(command(subs["subctx_2_1"].spawn), SPAWN_SLOW)
+        self.assertIn("/tmp/work/out.txt", command(subs["subctx_0_1"].fold))
+        self.assertIsNone(subs["subctx_2_1"].fold)  # still running when main ended
+
+        edges = traj.graph_edges()
+        spawns = {(a, b) for a, b, k in edges if k == "spawn"}
+        folds = {(a, b) for a, b, k in edges if k == "fold"}
+        self.assertEqual({b.split(":")[0] for _, b in spawns},
+                         {"subctx_0_1", "subctx_1_1", "subctx_2_1"})
+        self.assertEqual({a.split(":")[0] for a, _ in folds}, {"subctx_0_1", "subctx_1_1"})
 
 
 if __name__ == "__main__":

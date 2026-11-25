@@ -394,6 +394,8 @@ class SubagentPool:
             await self._loop(w)
         except asyncio.CancelledError:
             w.status = w.cancel_reason or "cancelled"
+            # An LM call cut short has no usage; keep metrics 1:1 with calls anyway.
+            w.metrics += [{}] * max(w.n_lm_calls - len(w.metrics), 0)
         except Exception as exc:  # noqa: BLE001 - a broken worker must not kill the run
             logger.warning("sub-agent %s failed: %s: %s", w.sub_id, type(exc).__name__, exc)
             w.status = f"error:{type(exc).__name__}"
@@ -461,7 +463,8 @@ class SubagentPool:
                 raise
             except Exception as exc:  # noqa: BLE001
                 w.metrics.append({})
-                w.status = "budget" if _is_context_overflow(exc) else f"error:{type(exc).__name__}"
+                w.status = ("budget" if _is_context_overflow(exc)
+                            else f"error:{type(exc).__name__}")
                 break
             llm_s = round(time.monotonic() - t0, 1)
             budget.calibrate(response, messages)
