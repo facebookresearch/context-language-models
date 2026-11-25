@@ -478,7 +478,8 @@ class SubagentPool:
             if action["type"] != "command" and action["type"] != "done":
                 if action["type"] == "context_status":
                     messages.append(msg)
-                    messages.append({"role": "tool", "tool_call_id": action.get("tool_call_id") or "",
+                    messages.append({"role": "tool",
+                                     "tool_call_id": action.get("tool_call_id") or "",
                                      "content": "(context_status is not available; use `bash`.)"})
                 else:
                     msg.pop("tool_calls", None)

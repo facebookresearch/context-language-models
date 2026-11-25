@@ -1,0 +1,64 @@
+# Task-instruction (instance) template for EDGEBENCH tasks with sub-agents. Selected with
+# `task_template=edgebench_sa`, together with `subagents=true` (see configs/edgebench_sa.yaml).
+#
+# Identical to edgebench.yaml (see its header for the EdgeBench task contract) plus a
+# final section on running parallel sub-agents. The
+# slot mechanism itself (file paths, slot count, limits) is described in the system prompt
+# when sub-agents are on, so this section only says when and how to use it.
+#
+# NOTE: prose paragraphs are intentionally kept on single (unwrapped) lines so the YAML
+# literal block does not inject mid-sentence newlines into the prompt text.
+instance_template: |
+  {{task}}
+
+  ## How to work on this problem
+
+  This task is scored on HOW GOOD your solution is, not on whether you finished. There is no pass/fail gate and no "done" state: a working first version earns a low score, and essentially all of your score comes from the improvement you make afterwards. Plan for a long run.
+
+  Start by reading what is already in the task directory — the README, the project skeleton, and especially any local tooling the task mentions (generators, testers, benchmarks, test suites). That tooling is your score signal. Get a baseline measured EARLY, before optimizing anything: you cannot tell an improvement from a regression without a number to compare against.
+
+  Then loop: make one change, measure it with the local tooling, keep it if it helps and revert it if it does not, and repeat. Measure little and often rather than making many changes and evaluating once at the end — a batch of changes that regresses tells you nothing about which change was at fault.
+
+  Your submitted files are graded EXACTLY as they are on disk whenever the run ends, and the run can end at any time without warning. So never leave the submission in a broken or half-edited state: develop risky changes in a scratch copy and only promote a change into the submitted path once you have measured it and it builds/runs.
+
+
+  ## Use the judge, not just your local tools
+
+  The task text tells you how to submit your work to the official judge (`edgebench-submit`). That score is the ONLY thing that counts, and your FINAL result is the BEST submission you ever make -- so submitting is free and a bad attempt costs you nothing. Submit ONCE IMMEDIATELY, before you start optimising or delegating, so a baseline is banked; then submit again after each meaningful change. A background process also auto-submits every few minutes, so keep the submitted paths runnable at all times. Use `edgebench-submit --list` to see your own score history and tell real improvements from regressions. Local tools are faster and unlimited: use them to filter ideas cheaply, and use the judge to confirm what actually helps.
+
+  ## Search discipline (what reliably improves quality)
+
+  - Keep a scratch tree OUTSIDE the submitted paths (e.g. `/tmp/edgebench/`) for experiments, candidate copies, and notes. Some tasks submit the whole directory, so stray experiment files can end up in your submission or confuse the judge.
+  - Keep an on-disk ledger of what you measured: append `"<score>\t<file-or-tag>\t<what changed>"` to `/tmp/edgebench/ledger.tsv`, and keep a short `/tmp/edgebench/notes.md` with your current best and WHY, the changes that IMPROVED the score, and the changes that REGRESSED. Do not retry a known dead end — re-testing one burns time you cannot get back.
+  - Branch from your CURRENT BEST measured version, not a stale or weaker one.
+  - Change ONE thing per measurement so the delta is attributable.
+  - Go DEEP when a method looks promising but underperforms: debug and tune THAT method over several attempts before pivoting. A correct, well-tuned strong approach beats many shallow different ones. Only move on once it is correct and still not improving.
+  - Spend the compute you are given: a longer or multi-restart search usually beats a cleverer but shorter one, when the task's evaluation allows it.
+  - Work in two phases. Early: try structurally different approaches to find a strong basin (explore). Once you are clearly strong: stop making structural changes and refine locally in smaller and smaller steps (exploit).
+  - Re-measure before you stop. The last thing you do should leave the submitted paths in their best MEASURED state, not in whatever state your final experiment left them.
+
+  ## Explore in parallel with sub-agents
+
+  These tasks reward breadth: structurally different approaches land in different basins, and you cannot know in advance which one wins. Your system prompt explains how to launch sub-agents (write a brief into an idle `/tmp/.live_ctx/SUBCTX_<i>.txt` slot) and how many can run at once. Use them from the start and keep the slots busy: one sub-agent per distinct approach early, then refinement sub-agents on the best measured versions, while you review results and promote winners.
+
+  Check which slots are free before you launch. A slot is busy while its file is in `/tmp/.live_ctx/`; when the sub-agent ends, the file moves to `/tmp/.live_ctx/finished_subagents/subctx_<i>_<n>/` and the slot is free again. Writing to a busy slot launches nothing:
+
+      ls /tmp/.live_ctx/SUBCTX_*.txt 2>/dev/null           # busy slots
+      ls /tmp/.live_ctx/finished_subagents/ 2>/dev/null    # sub-agents that have ended
+
+  Every tool result also carries a `sub-agents: R/N running` note, and a `SUBCTX_<i> finished (...)` note when one ends.
+
+  Coordinate through files. You and the sub-agents cannot see each other's context, so keep the shared ledger and notes (`/tmp/edgebench/ledger.tsv`, `/tmp/edgebench/notes.md`) as the common memory: every sub-agent reads `notes.md` before starting and appends its measurements to `ledger.tsv` and a one-line finding to `notes.md` when done. You read both between launches to decide what to run next (`sort -k1,1 -rn /tmp/edgebench/ledger.tsv | head`).
+
+  Only you submit to the judge, and only you write the submitted files. Sub-agents measure with the local tools in their own scratch directories and report numbers; you promote a winning version into the submitted path, measure it there, and then run `edgebench-submit`. This keeps the submitted files valid at all times.
+
+  Each brief must be self-contained (sub-agents do not see your context) and state: (1) a recap of the task and the exact local command that measures a candidate; (2) the approach this sub-agent should pursue; (3) a unique scratch directory and a ban on touching the submitted paths; (4) the ledger/notes protocol above. For example (use the full slot path; a relative `SUBCTX_1.txt` launches nothing):
+
+      cat > /tmp/.live_ctx/SUBCTX_1.txt <<'BRIEF'
+      Sub-task: <one-line task recap>. Measure a candidate with: <the exact local tooling command>.
+      First read /tmp/edgebench/notes.md and do not repeat a dead end listed there.
+      Approach: <the distinct approach for this sub-agent>.
+      Isolation: work only inside /tmp/edgebench/subctx_1/; copy what you need there first. Do not edit the task's submitted files.
+      Report: append "<score>\t/tmp/edgebench/subctx_1/<file>\tsubctx_1:<approach>" to /tmp/edgebench/ledger.tsv for every measurement, and one line "subctx_1 <approach>: best <score>, <what worked/failed>" to /tmp/edgebench/notes.md when done.
+      Finish with: echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
+      BRIEF

@@ -14,6 +14,7 @@ section differs across configurations. Pick a template with the
   * terminal_agent_tasks   — SWE-bench / terminal-bench style (solve-via-bash + workflow).
   * open_problems          — open-ended research tasks (e.g. DeepSearchQA).
   * edgebench              — EdgeBench tasks.
+  * edgebench_sa           — EdgeBench tasks with parallel sub-agents (needs subagents=true).
 
 Each ``<name>.yaml`` defines a single ``instance_template`` (with a ``{{task}}`` slot).
 """

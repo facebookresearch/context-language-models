@@ -108,6 +108,26 @@ class SettingsTests(unittest.TestCase):
         self.assertTrue(agent._ctx.subagents)
         self.assertIn("up to 5 sub-agents", agent._subs.prompt_addendum())
 
+    def test_edgebench_sa_config_and_template(self) -> None:
+        import yaml
+
+        from clm_harness.cli import CONFIG_DIR, _config_items
+        from clm_harness.task_templates import instance_template
+
+        _, base = _config_items("edgebench")
+        _, sa = _config_items("edgebench_sa")
+        self.assertEqual({k: v for k, v in sa.items() if base.get(k) != v},
+                         {"task_template": "edgebench_sa", "subagents": "true",
+                          "n_subagent_slots": "5", "subagent_max_steps": "40",
+                          "subagent_lifetime_cap": "24"})
+        self.assertEqual(set(base) - set(sa), set())
+        kwargs = yaml.safe_load((CONFIG_DIR / "edgebench_sa.yaml").read_text())["agent_kwargs"]
+        agent = ClmAgent(logs_dir=self.tmp, model_name=F.MODEL, **kwargs)
+        self.assertEqual(agent._subs.cfg.n_slots, 5)
+        self.assertTrue(instance_template("edgebench_sa").startswith(
+            instance_template("edgebench").rstrip("\n")))
+        self.assertIn("## Explore in parallel with sub-agents", instance_template("edgebench_sa"))
+
     def test_other_removed_settings_still_rejected(self) -> None:
         with self.assertRaises(ValueError):
             F.make_agent(self.tmp, subagents="true", shadow_hints="1")
