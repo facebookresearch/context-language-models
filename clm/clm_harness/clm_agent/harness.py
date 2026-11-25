@@ -673,6 +673,11 @@ class ClmAgent(BaseAgent):
         finally:
             if self._subs is not None:
                 await self._subs.cancel_all()
+            # Run totals: the main agent's own, plus its sub-agents' when they are on.
+            run_usage, run_cost, sub_usage = dict(usage_totals), self.cost, {}
+            if self._subs is not None:
+                run_usage, run_cost, sub_usage = self._subs.usage_report(
+                    usage_totals, self.cost, n_lm_calls=self.n_lm_calls, n_bash=n_bash)
             self.logs_dir.mkdir(parents=True, exist_ok=True)
             tk.record(self.logs_dir, total_iters + 1, messages, extra={"final": True})
             # Final retained context as one more snapshot on the same counter,
@@ -685,8 +690,8 @@ class ClmAgent(BaseAgent):
             (self.logs_dir / "usage.json").write_text(
                 json.dumps(
                     {
-                        **usage_totals,
-                        "cost_usd": self.cost,
+                        **run_usage,
+                        "cost_usd": run_cost,
                         "max_steps": self.max_steps,
                         "n_bash": n_bash,
                         "n_ctx_syncs": self._ctx.n_ctx_syncs,
@@ -714,14 +719,15 @@ class ClmAgent(BaseAgent):
                         "budget_finalized": self._budget.finalized,
                         # Hashes of the harness source, so runs can be matched to code.
                         "code_fingerprint": code_fingerprint(),
+                        **sub_usage,
                     },
                     indent=2,
                 )
                 + "\n"
             )
-            context.cost_usd = self.cost
-            context.n_input_tokens = usage_totals["prompt_tokens"]
-            context.n_output_tokens = usage_totals["completion_tokens"]
+            context.cost_usd = run_cost
+            context.n_input_tokens = run_usage["prompt_tokens"]
+            context.n_output_tokens = run_usage["completion_tokens"]
 
             if self.emit_ctx_trajectory:
                 try:
@@ -735,7 +741,7 @@ class ClmAgent(BaseAgent):
                         model_key=self.flops_model_key,
                         n_body=self.flops_n_body,
                         tokenizer=self.flops_tokenizer,
-                        cost_usd=self.cost,
+                        cost_usd=run_cost,
                         cost_metric=self.cost_metric,
                         completion_tokens_total=usage_totals["completion_tokens"],
                         token_counter=lambda m: tk.count_tokens(m)[0],

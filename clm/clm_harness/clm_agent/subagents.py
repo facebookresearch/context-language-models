@@ -600,6 +600,22 @@ class SubagentPool:
                  "spawn_call": w.spawn_call, "fold_call": w.fold_call,
                  "link": self._link(w)} for w in self._workers]
 
+    def usage_report(self, main_usage: dict[str, int], main_cost: float, *, n_lm_calls: int,
+                     n_bash: int) -> tuple[dict[str, int], float, dict[str, Any]]:
+        """Run totals for usage.json: ``(token totals, USD total, extra keys)``.
+
+        Token keys and ``cost_usd`` at the top level become main + sub-agents; the extra
+        keys add ``"main"`` and ``"subagents"`` blocks that sum to them."""
+        sub = self.usage()
+        totals = {k: v + int(sub.get(k, 0)) for k, v in main_usage.items()}
+        extra = {
+            "usage_scope": "main+subagents",
+            "main": {**main_usage, "cost_usd": main_cost, "n_lm_calls": n_lm_calls,
+                     "n_bash": n_bash},
+            "subagents": sub,
+        }
+        return totals, main_cost + sub["cost_usd"], extra
+
     def usage(self) -> dict[str, Any]:
         """Totals over all sub-agents (tokens, USD, calls) plus counts by status."""
         out: dict[str, Any] = {k: sum(w.usage[k] for w in self._workers) for k in _USAGE_KEYS}

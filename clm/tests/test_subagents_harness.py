@@ -89,6 +89,18 @@ class SettingsTests(unittest.TestCase):
         self.assertIsNone(agent._subs)
         self.assertFalse(agent._ctx.subagents)
 
+    def test_on_without_launches_keeps_totals(self) -> None:
+        sandbox = F.LocalSandbox(self.tmp / "sandbox")
+        agent = F.make_agent(self.tmp / "agent", subagents="true")
+        asyncio.run(F.run_agent(agent, sandbox, F.ScriptedLLM(["echo hi", F.SUBMIT])))
+        u = json.loads((self.tmp / "agent" / "usage.json").read_text())
+        self.assertEqual(u["prompt_tokens"], u["main"]["prompt_tokens"])
+        self.assertEqual(u["subagents"]["n_launched"], 0)
+        cc = json.loads((self.tmp / "agent" / "trajectory.ctx.json").read_text())
+        self.assertEqual(cc["final_metrics"]["extra"]["compute_cost"]["scope"], "main+subagents")
+        self.assertEqual(cc["final_metrics"]["extra"]["kv_cache_flops_subagents"]["n_parts"], 0)
+        self.assertFalse((self.tmp / "agent" / "subagents").exists())
+
     def test_on_with_defaults(self) -> None:
         agent = F.make_agent(self.tmp, subagents="true")
         self.assertEqual((agent._subs.cfg.n_slots, agent._subs.cfg.max_steps,
@@ -293,6 +305,43 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual({b.split(":")[0] for _, b in spawns},
                          {"subctx_0_1", "subctx_1_1", "subctx_2_1"})
         self.assertEqual({a.split(":")[0] for a, _ in folds}, {"subctx_0_1", "subctx_1_1"})
+
+    # --- accounting ---------------------------------------------------------
+    def test_usage_blocks_sum_to_run_totals(self) -> None:
+        u = self.usage
+        self.assertEqual(u["usage_scope"], "main+subagents")
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens"):
+            self.assertEqual(u[key], u["main"][key] + u["subagents"][key], key)
+        self.assertAlmostEqual(u["cost_usd"], u["main"]["cost_usd"] + u["subagents"]["cost_usd"])
+        self.assertGreater(u["subagents"]["prompt_tokens"], 0)
+        self.assertGreater(u["subagents"]["cost_usd"], 0)
+        self.assertEqual(u["n_lm_calls"], u["main"]["n_lm_calls"])  # the main agent's cap
+        self.assertEqual(u["subagents"]["n_launched"], 3)
+        self.assertEqual(u["subagents"]["by_status"],
+                         {"completed": 2, "cancelled_end_of_run": 1})
+        per_worker = [json.loads(p.read_text())
+                      for p in sorted((self.logs / "subagents").glob("*/summary.json"))]
+        self.assertEqual(u["subagents"]["prompt_tokens"],
+                         sum(w["prompt_tokens"] for w in per_worker))
+        self.assertEqual(u["subagents"]["n_lm_calls"], sum(w["n_lm_calls"] for w in per_worker))
+
+    def test_flops_and_compute_cost_scope(self) -> None:
+        traj = self.ctx_traj()
+        extra = traj.final_metrics.extra
+        self.assertEqual(extra["kv_cache_flops"]["n_llm_calls"], self.usage["main"]["n_lm_calls"])
+        subs = extra["kv_cache_flops_subagents"]
+        self.assertEqual(subs["n_parts"], 3)
+        self.assertEqual(subs["n_llm_calls"], self.usage["subagents"]["n_lm_calls"])
+        self.assertEqual(subs["naive_prefill_tokens"],
+                         sum(s.final_metrics.extra["kv_cache_flops"]["naive_prefill_tokens"]
+                             for s in traj.subtrajectories))
+        cc = extra["compute_cost"]
+        self.assertEqual(cc["scope"], "main+subagents")
+        self.assertAlmostEqual(cc["usd_api"], self.usage["cost_usd"])
+        self.assertAlmostEqual(traj.final_metrics.total_cost_usd, self.usage["cost_usd"])
+        self.assertEqual(cc["naive_prefill_tokens"],
+                         extra["kv_cache_flops"]["naive_prefill_tokens"]
+                         + subs["naive_prefill_tokens"])
 
 
 if __name__ == "__main__":

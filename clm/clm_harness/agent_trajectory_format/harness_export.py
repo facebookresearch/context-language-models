@@ -510,6 +510,35 @@ def attach_subtrajectories(
     return subs
 
 
+#: Additive fields of a ``kv_cache_flops`` dict (see ``compute_trajectory_flops``).
+_FLOPS_SUM_KEYS = (
+    "n_llm_calls", "n_aux_llm_calls", "aux_prefill_tokens", "aux_gen_tokens",
+    "n_reprefill_turns", "completion_tokens", "cache_aware_prefill_tokens",
+    "freeze_prefill_tokens", "naive_prefill_tokens", "cache_hit_tokens",
+    "cache_aware_attn_flops", "freeze_attn_flops", "naive_attn_flops",
+    "cache_aware_flops_linear", "freeze_flops_linear", "naive_flops_linear",
+    "cache_aware_flops", "freeze_flops", "naive_flops",
+)
+
+
+def sum_flops(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Sum ``kv_cache_flops`` dicts of separate trajectories (e.g. sub-agents, whose
+    prompts share no KV cache with each other). Additive fields are summed (``None`` if
+    every part has ``None``), the saved fractions recomputed, and the descriptive fields
+    taken from the first part. ``n_parts`` counts the inputs."""
+    out: dict[str, Any] = dict(parts[0]) if parts else {}
+    for k in _FLOPS_SUM_KEYS:
+        vals = [p.get(k) for p in parts]
+        out[k] = None if parts and all(v is None for v in vals) else sum(v or 0 for v in vals)
+    naive = out.get("naive_prefill_tokens") or 0
+    out["cache_saved_frac"] = round((out.get("cache_hit_tokens") or 0) / naive, 4) if naive else 0.0
+    out["freeze_saved_frac"] = (
+        round((naive - (out.get("freeze_prefill_tokens") or 0)) / naive, 4) if naive else 0.0)
+    out["prefill_source"] = ",".join(sorted({str(p.get("prefill_source")) for p in parts}))
+    out["n_parts"] = len(parts)
+    return out
+
+
 def export_ctx_trajectory(
     agent_dir: Path | str,
     *,
@@ -559,7 +588,7 @@ def export_ctx_trajectory(
         aux_prefill_tokens=aux_prefill_tokens, aux_gen_tokens=aux_gen_tokens,
         n_aux_calls=n_aux_calls,
     )
-    if subagents:
+    if subagents is not None:
         attach_subtrajectories(
             traj, subagents, agent=agent, session_id=session_id, model=resolved_model,
             model_key=model_key, n_body=n_body, tokenizer=tokenizer,
@@ -576,6 +605,22 @@ def export_ctx_trajectory(
         traj, cost_usd=cost_usd, model=resolved_model, cost_metric=cost_metric,
         in_rate=_in, out_rate=_out,
     )
+    if subagents is not None:
+        # kv_cache_flops stays the main agent's; the sub-agents get their own total, and
+        # compute_cost (with cost_usd, already the run total) covers both.
+        from ..flops_metrics import summarize_compute_cost
+
+        extra = traj.final_metrics.extra
+        sub_flops = sum_flops([s.final_metrics.extra["kv_cache_flops"]
+                               for s in traj.subtrajectories])
+        extra["kv_cache_flops_subagents"] = sub_flops
+        both = sum_flops([extra["kv_cache_flops"], sub_flops]) if traj.subtrajectories \
+            else extra["kv_cache_flops"]
+        extra["compute_cost"] = {
+            **summarize_compute_cost(both, cost_usd=cost_usd, model=resolved_model,
+                                     cost_metric=cost_metric, in_rate=_in, out_rate=_out),
+            "scope": "main+subagents",
+        }
     if filename:
         out = Path(agent_dir)
         out.mkdir(parents=True, exist_ok=True)
